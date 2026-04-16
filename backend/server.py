@@ -375,8 +375,56 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     }
 
 # =============================================================================
-# EXTRACTION ENGINE
+# EXTRACTION ENGINE — Multi-OCR with fallback
 # =============================================================================
+def preprocess_image_for_ocr(img):
+    """Enhance image contrast and binarize for better OCR results."""
+    from PIL import ImageEnhance, ImageFilter
+    gray = img.convert("L")
+    enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
+    sharpened = enhanced.filter(ImageFilter.SHARPEN)
+    binarized = sharpened.point(lambda x: 0 if x < 140 else 255, '1')
+    return binarized.convert("L")
+
+def ocr_with_tesseract(images, filename):
+    """Primary OCR: Tesseract. Returns (text, avg_confidence)."""
+    import pytesseract
+    ocr_parts = []
+    total_conf = 0
+    conf_count = 0
+    for img in images:
+        ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        page_text = " ".join([w for w, c in zip(ocr_data["text"], ocr_data["conf"]) if int(c) > 0 and w.strip()])
+        confidences = [int(c) for c in ocr_data["conf"] if int(c) > 0]
+        if confidences:
+            total_conf += sum(confidences)
+            conf_count += len(confidences)
+        ocr_parts.append(page_text)
+    text = "\n".join(ocr_parts).strip()
+    avg_conf = total_conf / conf_count if conf_count > 0 else 0
+    return text, avg_conf
+
+def ocr_with_easyocr(images, filename):
+    """Backup OCR: EasyOCR (deep learning). Returns (text, avg_confidence)."""
+    import easyocr
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    import numpy as np
+    all_text = []
+    total_conf = 0
+    conf_count = 0
+    for img in images:
+        img_array = np.array(img)
+        results = reader.readtext(img_array)
+        page_parts = []
+        for (_, text, conf) in results:
+            page_parts.append(text)
+            total_conf += conf
+            conf_count += 1
+        all_text.append(" ".join(page_parts))
+    text = "\n".join(all_text).strip()
+    avg_conf = (total_conf / conf_count * 100) if conf_count > 0 else 0
+    return text, avg_conf
+
 async def extract_text_from_pdf(pdf_bytes: bytes, filename: str):
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -388,32 +436,66 @@ async def extract_text_from_pdf(pdf_bytes: bytes, filename: str):
             text = "\n".join(text_parts).strip()
             if text:
                 return text, None
-            # No text found - try OCR
+
+            # --- No embedded text: OCR pipeline ---
             try:
-                import pytesseract
                 from pdf2image import convert_from_bytes
                 images = convert_from_bytes(pdf_bytes)
-                ocr_parts = []
-                total_conf = 0
-                conf_count = 0
-                for img in images:
-                    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-                    page_text = " ".join([w for w, c in zip(ocr_data["text"], ocr_data["conf"]) if int(c) > 0 and w.strip()])
-                    confidences = [int(c) for c in ocr_data["conf"] if int(c) > 0]
-                    if confidences:
-                        total_conf += sum(confidences)
-                        conf_count += len(confidences)
-                    ocr_parts.append(page_text)
-                ocr_text = "\n".join(ocr_parts).strip()
-                avg_conf = total_conf / conf_count if conf_count > 0 else 0
-                if not ocr_text:
-                    return None, {"reason": "No text layer detected", "missing_fields": "All fields"}
-                if avg_conf < 70:
-                    return ocr_text, {"reason": f"Low confidence OCR ({avg_conf:.0f}%) - manual review recommended", "partial": True}
-                return ocr_text, None
-            except Exception as ocr_err:
-                logger.error(f"OCR failed for {filename}: {ocr_err}")
+            except Exception as conv_err:
+                logger.error(f"PDF to image conversion failed for {filename}: {conv_err}")
                 return None, {"reason": "Unreadable scanned image", "missing_fields": "All fields"}
+
+            # Step 1: Tesseract on original images
+            tess_text, tess_conf = "", 0
+            try:
+                tess_text, tess_conf = ocr_with_tesseract(images, filename)
+                logger.info(f"Tesseract OCR for {filename}: conf={tess_conf:.0f}%, chars={len(tess_text)}")
+            except Exception as e:
+                logger.warning(f"Tesseract failed for {filename}: {e}")
+
+            if tess_text and tess_conf >= 70:
+                return tess_text, None
+
+            # Step 2: Tesseract on preprocessed images (contrast + binarize)
+            tess2_text, tess2_conf = "", 0
+            try:
+                preprocessed = [preprocess_image_for_ocr(img) for img in images]
+                tess2_text, tess2_conf = ocr_with_tesseract(preprocessed, filename)
+                logger.info(f"Tesseract (preprocessed) for {filename}: conf={tess2_conf:.0f}%, chars={len(tess2_text)}")
+            except Exception as e:
+                logger.warning(f"Tesseract preprocessed failed for {filename}: {e}")
+
+            if tess2_text and tess2_conf >= 70:
+                return tess2_text, None
+
+            # Step 3: EasyOCR (deep learning backup)
+            easy_text, easy_conf = "", 0
+            try:
+                easy_text, easy_conf = ocr_with_easyocr(images, filename)
+                logger.info(f"EasyOCR for {filename}: conf={easy_conf:.0f}%, chars={len(easy_text)}")
+            except Exception as e:
+                logger.warning(f"EasyOCR failed for {filename}: {e}")
+
+            if easy_text and easy_conf >= 70:
+                return easy_text, None
+
+            # Step 4: Pick the best result from all attempts
+            candidates = [
+                (tess_text, tess_conf, "Tesseract"),
+                (tess2_text, tess2_conf, "Tesseract-preprocessed"),
+                (easy_text, easy_conf, "EasyOCR"),
+            ]
+            best_text, best_conf, best_engine = max(candidates, key=lambda c: (len(c[0]), c[1]))
+
+            if not best_text:
+                return None, {"reason": "No text layer detected - all OCR engines failed", "missing_fields": "All fields"}
+
+            # We have text but below 70% confidence from any engine
+            return best_text, {
+                "reason": f"Low confidence OCR ({best_conf:.0f}% via {best_engine}) - manual review recommended",
+                "partial": True
+            }
+
     except Exception as e:
         logger.error(f"PDF processing failed for {filename}: {e}")
         return None, {"reason": f"Corrupted or unreadable PDF: {str(e)}", "missing_fields": "All fields"}
