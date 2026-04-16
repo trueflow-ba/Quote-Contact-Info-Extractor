@@ -677,18 +677,34 @@ async def process_run(run_id: str, user_id: str):
             else:
                 filtered.append(c)
         all_contacts = filtered
-        seen_emails = set()
+        seen_emails = {}
         duplicates_removed = 0
+        duplicate_records = []
         unique_contacts = []
         for c in all_contacts:
             email = c.get("email", "").lower().strip()
             if email and email in seen_emails:
                 duplicates_removed += 1
+                duplicate_records.append({
+                    "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                    "email": email,
+                    "kept_source": seen_emails[email].get("source_filename", ""),
+                    "duplicate_source": c.get("source_filename", ""),
+                    "first_name": c.get("first_name", ""),
+                    "last_name": c.get("last_name", ""),
+                    "company": c.get("company", ""),
+                    "city": c.get("city", ""),
+                    "state": c.get("state", ""),
+                    "phone": c.get("phone", ""),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                })
             else:
                 if email:
-                    seen_emails.add(email)
+                    seen_emails[email] = c
                 unique_contacts.append(c)
         all_contacts = unique_contacts
+        if duplicate_records:
+            await db.duplicates.insert_many(duplicate_records)
         if all_contacts:
             contact_docs = [{
                 "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
@@ -771,6 +787,29 @@ async def get_run_errors(run_id: str, request: Request):
     errors = await db.processing_errors.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(1000)
     return errors
 
+@api_router.get("/runs/{run_id}/duplicates")
+async def get_run_duplicates(run_id: str, request: Request):
+    user = await get_current_user(request)
+    duplicates = await db.duplicates.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
+    return duplicates
+
+@api_router.get("/runs/{run_id}/charts")
+async def get_run_charts(run_id: str, request: Request):
+    user = await get_current_user(request)
+    contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
+    city_counts = {}
+    state_counts = {}
+    for c in contacts:
+        city = c.get("city", "").strip()
+        state = c.get("state", "").strip()
+        if city:
+            city_counts[city] = city_counts.get(city, 0) + 1
+        if state:
+            state_counts[state] = state_counts.get(state, 0) + 1
+    city_data = sorted([{"name": k, "count": v} for k, v in city_counts.items()], key=lambda x: -x["count"])[:20]
+    state_data = sorted([{"name": k, "count": v} for k, v in state_counts.items()], key=lambda x: -x["count"])[:20]
+    return {"by_city": city_data, "by_state": state_data}
+
 @api_router.get("/runs/{run_id}/download/contacts")
 async def download_contacts_csv(run_id: str, request: Request):
     user = await get_current_user(request)
@@ -820,6 +859,7 @@ async def startup():
     await db.processing_errors.create_index("run_id")
     await db.files.create_index("run_id")
     await db.progress.create_index("run_id")
+    await db.duplicates.create_index("run_id")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trueflow.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "TrueFlow2024!")

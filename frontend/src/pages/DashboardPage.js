@@ -8,7 +8,9 @@ import StatsCards from '@/components/StatsCards';
 import UploadZone from '@/components/UploadZone';
 import ContactsTable from '@/components/ContactsTable';
 import ErrorsTable from '@/components/ErrorsTable';
+import DuplicatesTable from '@/components/DuplicatesTable';
 import RunHistory from '@/components/RunHistory';
+import DataViz from '@/components/DataViz';
 
 export default function DashboardPage() {
   const [runs, setRuns] = useState([]);
@@ -16,6 +18,8 @@ export default function DashboardPage() {
   const [currentRun, setCurrentRun] = useState(null);
   const [contacts, setContacts] = useState([]);
   const [errors, setErrors] = useState([]);
+  const [duplicates, setDuplicates] = useState([]);
+  const [chartData, setChartData] = useState(null);
   const [files, setFiles] = useState([]);
   const [progress, setProgress] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -36,14 +40,18 @@ export default function DashboardPage() {
 
   const fetchRunData = useCallback(async (runId) => {
     try {
-      const [runResp, contactsResp, errorsResp] = await Promise.all([
+      const [runResp, contactsResp, errorsResp, dupesResp, chartsResp] = await Promise.all([
         api.get(`/runs/${runId}`),
         api.get(`/runs/${runId}/contacts`),
         api.get(`/runs/${runId}/errors`),
+        api.get(`/runs/${runId}/duplicates`),
+        api.get(`/runs/${runId}/charts`),
       ]);
       setCurrentRun(runResp.data);
       setContacts(contactsResp.data);
       setErrors(errorsResp.data);
+      setDuplicates(dupesResp.data);
+      setChartData(chartsResp.data);
     } catch { /* silent */ }
   }, []);
 
@@ -161,15 +169,25 @@ export default function DashboardPage() {
           )}
         </div>
 
+        {/* Data Visualization */}
+        <DataViz chartData={chartData} />
+
         {/* Results Tabs */}
         <Tabs defaultValue="results" className="w-full">
-          <TabsList className="bg-[#111827] border border-slate-800 p-1 h-auto rounded-sm">
+          <TabsList className="bg-[#111827] border border-slate-800 p-1 h-auto rounded-sm flex-wrap">
             <TabsTrigger
               value="results"
               className="text-sm data-[state=active]:bg-sky-500/10 data-[state=active]:text-sky-400 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5"
               data-testid="tab-results"
             >
               Results {contacts.length > 0 && `(${contacts.length})`}
+            </TabsTrigger>
+            <TabsTrigger
+              value="duplicates"
+              className="text-sm data-[state=active]:bg-purple-500/10 data-[state=active]:text-purple-400 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5"
+              data-testid="tab-duplicates"
+            >
+              Duplicates {duplicates.length > 0 && `(${duplicates.length})`}
             </TabsTrigger>
             <TabsTrigger
               value="issues"
@@ -189,6 +207,9 @@ export default function DashboardPage() {
 
           <TabsContent value="results" className="mt-4 animate-fade-in">
             <ContactsTable contacts={contacts} runId={currentRunId} />
+          </TabsContent>
+          <TabsContent value="duplicates" className="mt-4 animate-fade-in">
+            <DuplicatesTable duplicates={duplicates} />
           </TabsContent>
           <TabsContent value="issues" className="mt-4 animate-fade-in">
             <ErrorsTable errors={errors} runId={currentRunId} />
