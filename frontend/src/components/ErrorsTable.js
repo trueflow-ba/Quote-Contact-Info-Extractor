@@ -8,12 +8,15 @@ export default function ErrorsTable({ errors, runId }) {
     if (!runId) return;
     try {
       const resp = await api.get(`/runs/${runId}/download/errors`, { responseType: 'blob' });
-      const url = URL.createObjectURL(resp.data);
+      const blob = new Blob([resp.data], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `error_report_${runId.slice(0, 8)}.csv`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       toast.success('Error report downloaded');
     } catch {
       toast.error('Failed to download error report');

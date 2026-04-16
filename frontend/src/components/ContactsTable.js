@@ -53,12 +53,15 @@ export default function ContactsTable({ contacts, runId }) {
     if (!runId) return;
     try {
       const resp = await api.get(`/runs/${runId}/download/contacts`, { responseType: 'blob' });
-      const url = URL.createObjectURL(resp.data);
+      const blob = new Blob([resp.data], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `contacts_${runId.slice(0, 8)}.csv`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       toast.success('CSV downloaded');
     } catch {
       toast.error('Failed to download CSV');
