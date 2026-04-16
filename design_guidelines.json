@@ -1,0 +1,128 @@
+{
+  "theme": "DARK",
+  "archetype": "High-Contrast Executive Dark (Archetype 4 + 5 Hybrid)",
+  "brand_name": "TrueFlow Business Automations",
+  "app_name": "QuoteExtract",
+  "typography": {
+    "headings": {
+      "family": "Work Sans",
+      "weights": ["400", "600"],
+      "tracking": "tracking-tight",
+      "usage_rules": "Use for all page titles, stat card numbers, and modal headers. Never use Inter for headings. It provides an industrial, solid construction feel."
+    },
+    "body": {
+      "family": "IBM Plex Sans",
+      "weights": ["400", "500"],
+      "usage_rules": "Use for all data tables, labels, tooltips, and body text. Highly legible for dense technical interfaces."
+    },
+    "data_display": {
+      "family": "IBM Plex Mono",
+      "weights": ["400"],
+      "usage_rules": "Use for extracted phone numbers, dates, and API keys to align numerical data perfectly."
+    }
+  },
+  "colors": {
+    "background": {
+      "page": "#0A0F1C",
+      "card": "#111827",
+      "hover": "#1E293B",
+      "description": "Deep navy blueprint background. Never use pure black. Tinted heavily with blue to match 'Dark navy color scheme'."
+    },
+    "text": {
+      "primary": "#F8FAFC",
+      "secondary": "#94A3B8",
+      "muted": "#64748B",
+      "inverse": "#020617"
+    },
+    "brand": {
+      "primary": "#0EA5E9",
+      "primary_hover": "#0284C7",
+      "accent": "#F59E0B",
+      "error": "#EF4444",
+      "success": "#10B981",
+      "description": "Primary CTA is Sky Blue. Processing/Accent is Construction Amber. High visibility against dark navy."
+    },
+    "border": {
+      "default": "#1E293B",
+      "focus": "#0EA5E9"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "Control Room Grid. Dense, functional, optimized for scanning and data extraction tasks.",
+    "container": "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8",
+    "dashboard_grid": {
+      "type": "grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6",
+      "stats_cards": "col-span-1",
+      "upload_area": "col-span-full lg:col-span-2",
+      "data_table": "col-span-full"
+    },
+    "surfaces": {
+      "radius": "rounded-sm",
+      "shadows": "shadow-none",
+      "borders": "1px solid border-slate-800"
+    }
+  },
+  "component_strategies": {
+    "header": {
+      "style": "Solid Background with a hard bottom border",
+      "classes": "bg-[#0A0F1C] border-b border-slate-800 sticky top-0 z-50 h-16 flex items-center justify-between px-6"
+    },
+    "stat_cards": {
+      "style": "Technical look. Flat background, sharp edges.",
+      "classes": "bg-[#111827] border border-slate-800 rounded-sm p-5 hover:border-slate-700 transition-colors flex flex-col gap-2"
+    },
+    "upload_zone": {
+      "style": "The Technical Grid Border. Dashed border with subtle background tint.",
+      "classes": "border-2 border-dashed border-slate-700 bg-slate-900/30 rounded-sm p-12 flex flex-col items-center justify-center hover:border-sky-500 hover:bg-slate-800/50 transition-colors cursor-pointer"
+    },
+    "data_table": {
+      "style": "Compact, zebra striping, sticky header.",
+      "header_classes": "bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-4 text-left border-b border-slate-800",
+      "row_classes": "border-b border-slate-800 hover:bg-slate-800/30 transition-colors text-sm text-slate-300"
+    },
+    "buttons": {
+      "primary": "bg-sky-500 hover:bg-sky-600 text-white rounded-sm px-5 py-2.5 font-medium transition-colors focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 focus:ring-offset-[#0A0F1C] inline-flex items-center justify-center gap-2",
+      "secondary": "bg-transparent border border-slate-700 text-slate-300 hover:bg-slate-800 hover:text-white rounded-sm px-4 py-2 transition-colors inline-flex items-center gap-2",
+      "danger": "bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-sm px-4 py-2 transition-colors inline-flex items-center gap-2"
+    },
+    "progress_bar": {
+      "style": "Industrial neon fill",
+      "track": "bg-slate-800 rounded-full h-1.5 overflow-hidden w-full",
+      "fill": "bg-amber-500 h-full transition-all duration-300 ease-out shadow-[0_0_8px_rgba(245,158,11,0.5)]"
+    }
+  },
+  "icons_and_assets": {
+    "library": "lucide-react",
+    "usage": "Use stroke-width 1.5 for a technical, precise feel. Icons should be 16px to 20px.",
+    "images": [
+      {
+        "category": "login_background",
+        "url": "https://images.unsplash.com/photo-1773666330599-bf7afde8fbf7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHwyfHxkYXJrJTIwYXJjaGl0ZWN0dXJlJTIwYmx1ZXByaW50JTIwZ2VvbWV0cmljJTIwYWJzdHJhY3R8ZW58MHx8fHwxNzc2MzgwMTQ3fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Abstract dark architectural pattern. Use as a split-screen background on the login page with a heavy overlay (bg-[#0A0F1C]/80) to ensure text legibility.",
+        "placement": "Login Page Background Split"
+      }
+    ]
+  },
+  "accessibility_and_testing": {
+    "test_ids": {
+      "login_email_input": "data-testid='login-email-input'",
+      "login_password_input": "data-testid='login-password-input'",
+      "login_submit_btn": "data-testid='login-submit-button'",
+      "upload_input": "data-testid='file-upload-input'",
+      "extract_btn": "data-testid='extract-contacts-button'",
+      "download_csv_btn": "data-testid='download-csv-button'",
+      "download_error_btn": "data-testid='download-error-csv-button'",
+      "settings_save_btn": "data-testid='settings-save-button'"
+    },
+    "contrast": "Ensure all text against the #0A0F1C background meets AA (4.5:1) contrast."
+  },
+  "instructions_to_main_agent": [
+    "Use standard pure HTML/Tailwind for structural dashboard layouts. Do not wrap entire pages in Shadcn card components.",
+    "Use Shadcn UI primarily for interactive/complex logic elements: Tables, Dialogs, Dropdowns, Progress, Tabs, Toasts.",
+    "Implement Shadcn Tabs for navigating between 'Results', 'Issues Table', and 'Run History' on the dashboard.",
+    "Ensure the data table is highly compact for business scanning. Override Shadcn Table default paddings to py-2 px-3.",
+    "For the file upload, implement a drag-and-drop zone using the defined upload_zone classes. Hide the native file input visually.",
+    "Install Google Fonts 'Work Sans' (Headings) and 'IBM Plex Sans' (Body) via standard methodology.",
+    "Ensure the layout is completely mobile responsive with a flex-col fallback for the Control Room Grid on small screens."
+  ]
+}
