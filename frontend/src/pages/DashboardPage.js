@@ -67,6 +67,24 @@ export default function DashboardPage() {
     if (run) setCurrentRun(run);
   };
 
+  const deleteRun = (runId) => {
+    const updated = runs.filter(r => r.id !== runId);
+    setRuns(updated);
+    if (currentRunId === runId) {
+      if (updated.length > 0) {
+        setCurrentRunId(updated[0].id);
+        setCurrentRun(updated[0]);
+      } else {
+        setCurrentRunId(null);
+        setCurrentRun(null);
+        setContacts([]);
+        setErrors([]);
+        setDuplicates([]);
+        setChartData(null);
+      }
+    }
+  };
+
   const pollProgress = useCallback(async (runId) => {
     try {
       const { data } = await api.get(`/progress/${runId}`);
@@ -215,7 +233,7 @@ export default function DashboardPage() {
             <ErrorsTable errors={errors} runId={currentRunId} />
           </TabsContent>
           <TabsContent value="history" className="mt-4 animate-fade-in">
-            <RunHistory runs={runs} onSelectRun={selectRun} currentRunId={currentRunId} />
+            <RunHistory runs={runs} onSelectRun={selectRun} onDeleteRun={deleteRun} currentRunId={currentRunId} />
           </TabsContent>
         </Tabs>
       </main>

@@ -17,6 +17,7 @@ cryptography==46.0.7
 cuda-bindings==13.2.0
 cuda-pathfinder==1.5.3
 cuda-toolkit==13.0.2
+Deprecated==1.3.1
 distro==1.9.0
 dnspython==2.8.0
 easyocr==1.7.2
@@ -59,6 +60,7 @@ jsonschema-specifications==2025.9.1
 lazy-loader==0.5
 librt==0.8.1
 litellm==1.80.0
+lxml==6.0.4
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 mccabe==0.7.0
@@ -96,6 +98,7 @@ pathspec==1.0.4
 pdf2image==1.17.0
 pdfminer.six==20251230
 pdfplumber==0.11.9
+pikepdf==10.5.1
 pillow==12.2.0
 platformdirs==4.9.6
 pluggy==1.6.0
@@ -159,5 +162,6 @@ urllib3==2.6.3
 uvicorn==0.25.0
 watchfiles==1.1.1
 websockets==16.0
+wrapt==2.1.2
 yarl==1.23.0
 zipp==3.23.0

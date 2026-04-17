@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import { toast } from 'sonner';
 import { Input } from '@/components/ui/input';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
-import { Save, Loader2, Key, Globe, Cpu } from 'lucide-react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Save, Loader2, Key, Globe, Cpu, Trash2, AlertTriangle } from 'lucide-react';
 import api from '@/lib/api';
 import Header from '@/components/Header';
 
@@ -17,6 +18,9 @@ export default function SettingsPage() {
   });
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [showDeleteAll, setShowDeleteAll] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [deletingAll, setDeletingAll] = useState(false);
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -39,13 +43,27 @@ export default function SettingsPage() {
         exclusion_domain: settings.exclusion_domain,
       });
       toast.success('Settings saved');
-      // Re-fetch to update the "set" flags
       const { data } = await api.get('/settings');
       setSettings(data);
-    } catch (err) {
+    } catch {
       toast.error('Failed to save settings');
     }
     setSaving(false);
+  };
+
+  const handleDeleteAll = async () => {
+    if (deleteConfirmText !== 'DELETE ALL') return;
+    setDeletingAll(true);
+    try {
+      const { data } = await api.delete('/data/all');
+      const d = data.deleted || {};
+      toast.success(`Deleted ${d.runs || 0} runs, ${d.contacts || 0} contacts, ${d.errors || 0} errors`);
+      setShowDeleteAll(false);
+      setDeleteConfirmText('');
+    } catch {
+      toast.error('Failed to delete data');
+    }
+    setDeletingAll(false);
   };
 
   if (loading) {
@@ -147,7 +165,72 @@ export default function SettingsPage() {
           {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
           Save Settings
         </button>
+
+        {/* Data Management - Danger Zone */}
+        <section className="bg-[#111827] border border-red-500/20 rounded-sm p-6 space-y-4 mt-12">
+          <div className="flex items-center gap-2 mb-2">
+            <Trash2 className="h-4 w-4 text-red-400" strokeWidth={1.5} />
+            <h2 className="text-sm font-semibold text-red-400 uppercase tracking-wider">Data Management</h2>
+          </div>
+          <p className="text-xs text-slate-500">
+            Permanently delete all your extraction data. Individual runs can be deleted from the Run History tab on the dashboard.
+          </p>
+          <div className="flex items-start gap-3 bg-red-500/5 border border-red-500/10 rounded-sm p-3">
+            <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" strokeWidth={1.5} />
+            <p className="text-xs text-slate-400">
+              This will delete <strong className="text-slate-300">all runs, contacts, duplicates, error reports, and uploaded file references</strong>. Your account settings will be preserved. This action cannot be undone.
+            </p>
+          </div>
+          <button
+            onClick={() => setShowDeleteAll(true)}
+            className="bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-sm px-5 py-2 text-sm font-medium transition-colors inline-flex items-center gap-2"
+            data-testid="delete-all-data-button"
+          >
+            <Trash2 className="h-4 w-4" /> Delete All Data
+          </button>
+        </section>
       </main>
+
+      {/* Confirm Delete All Dialog */}
+      <Dialog open={showDeleteAll} onOpenChange={(open) => { if (!open) { setShowDeleteAll(false); setDeleteConfirmText(''); } }}>
+        <DialogContent className="bg-[#111827] border-slate-800 text-slate-200 max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-red-400 flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5" /> Delete All Data
+            </DialogTitle>
+            <DialogDescription className="text-slate-400">
+              This will permanently delete all your extraction runs, contacts, duplicates, error reports, and uploaded file references. Your account and settings will be preserved.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <p className="text-xs text-slate-500">Type <strong className="text-red-400 font-mono">DELETE ALL</strong> to confirm:</p>
+            <Input
+              data-testid="delete-all-confirm-input"
+              value={deleteConfirmText}
+              onChange={e => setDeleteConfirmText(e.target.value)}
+              placeholder="Type DELETE ALL"
+              className="bg-[#0A0F1C] border-slate-800 text-slate-300 placeholder:text-slate-600 font-mono"
+            />
+          </div>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <button
+              onClick={() => { setShowDeleteAll(false); setDeleteConfirmText(''); }}
+              className="bg-transparent border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-sm px-4 py-2 text-sm transition-colors"
+              data-testid="cancel-delete-all"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleDeleteAll}
+              disabled={deleteConfirmText !== 'DELETE ALL' || deletingAll}
+              className="bg-red-500 hover:bg-red-600 text-white rounded-sm px-4 py-2 text-sm font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              data-testid="confirm-delete-all"
+            >
+              {deletingAll ? 'Deleting...' : 'Delete Everything'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -375,8 +375,29 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     }
 
 # =============================================================================
-# EXTRACTION ENGINE — Multi-OCR with fallback
+# EXTRACTION ENGINE — Multi-OCR with fallback + PDF compression
 # =============================================================================
+PDF_SIZE_THRESHOLD = 5 * 1024 * 1024  # 5 MB
+
+def compress_pdf(pdf_bytes: bytes, filename: str) -> bytes:
+    """Compress large PDFs while preserving text layers and image quality for OCR."""
+    import pikepdf
+    try:
+        original_size = len(pdf_bytes)
+        src = pikepdf.Pdf.open(io.BytesIO(pdf_bytes))
+        # Linearize and recompress streams
+        out = io.BytesIO()
+        src.save(out, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                 recompress_flate=True)
+        compressed = out.getvalue()
+        ratio = len(compressed) / original_size * 100
+        logger.info(f"PDF compression for {filename}: {original_size / 1024:.0f}KB -> {len(compressed) / 1024:.0f}KB ({ratio:.0f}%)")
+        src.close()
+        return compressed
+    except Exception as e:
+        logger.warning(f"PDF compression failed for {filename}, using original: {e}")
+        return pdf_bytes
+
 def preprocess_image_for_ocr(img):
     """Enhance image contrast and binarize for better OCR results."""
     from PIL import ImageEnhance, ImageFilter
@@ -594,6 +615,9 @@ async def process_run(run_id: str, user_id: str):
                 )
                 try:
                     pdf_bytes = get_object(file_record["storage_path"])
+                    # Compress large PDFs before processing
+                    if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
+                        pdf_bytes = compress_pdf(pdf_bytes, filename)
                     text, text_error = await extract_text_from_pdf(pdf_bytes, filename)
                     if text_error and not text_error.get("partial", False):
                         await db.processing_errors.insert_one({
@@ -841,6 +865,37 @@ async def download_errors_csv(run_id: str, request: Request):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=error_report_{run_id[:8]}.csv"}
     )
+
+# =============================================================================
+# DELETE ROUTES
+# =============================================================================
+@api_router.delete("/runs/{run_id}")
+async def delete_run(run_id: str, request: Request):
+    user = await get_current_user(request)
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    await db.runs.delete_one({"id": run_id, "user_id": user["_id"]})
+    await db.contacts.delete_many({"run_id": run_id, "user_id": user["_id"]})
+    await db.processing_errors.delete_many({"run_id": run_id, "user_id": user["_id"]})
+    await db.duplicates.delete_many({"run_id": run_id, "user_id": user["_id"]})
+    await db.progress.delete_many({"run_id": run_id})
+    await db.files.update_many({"run_id": run_id, "user_id": user["_id"]}, {"$set": {"is_deleted": True}})
+    return {"message": "Run deleted"}
+
+@api_router.delete("/data/all")
+async def delete_all_data(request: Request):
+    user = await get_current_user(request)
+    uid = user["_id"]
+    results = {}
+    results["runs"] = (await db.runs.delete_many({"user_id": uid})).deleted_count
+    results["contacts"] = (await db.contacts.delete_many({"user_id": uid})).deleted_count
+    results["errors"] = (await db.processing_errors.delete_many({"user_id": uid})).deleted_count
+    results["duplicates"] = (await db.duplicates.delete_many({"user_id": uid})).deleted_count
+    results["files"] = (await db.files.update_many({"user_id": uid}, {"$set": {"is_deleted": True}})).modified_count
+    run_ids = [r["run_id"] async for r in db.progress.find({})]
+    await db.progress.delete_many({})
+    return {"message": "All data deleted", "deleted": results}
 
 # =============================================================================
 # STARTUP / MIDDLEWARE
