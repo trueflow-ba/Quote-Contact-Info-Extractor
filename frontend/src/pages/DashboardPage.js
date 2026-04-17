@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Loader2, Zap } from 'lucide-react';
+import { Loader2, Zap, Pause, Play, XCircle } from 'lucide-react';
 import api from '@/lib/api';
 import Header from '@/components/Header';
 import StatsCards from '@/components/StatsCards';
@@ -40,20 +40,32 @@ export default function DashboardPage() {
 
   const fetchRunData = useCallback(async (runId) => {
     try {
-      const [runResp, contactsResp, errorsResp, dupesResp, chartsResp] = await Promise.all([
+      const [runResp, contactsResp, errorsResp, dupesResp, chartsResp, progressResp] = await Promise.all([
         api.get(`/runs/${runId}`),
         api.get(`/runs/${runId}/contacts`),
         api.get(`/runs/${runId}/errors`),
         api.get(`/runs/${runId}/duplicates`),
         api.get(`/runs/${runId}/charts`),
+        api.get(`/progress/${runId}`),
       ]);
       setCurrentRun(runResp.data);
       setContacts(contactsResp.data);
       setErrors(errorsResp.data);
       setDuplicates(dupesResp.data);
       setChartData(chartsResp.data);
+      // Restore progress state for paused/processing runs
+      const prog = progressResp.data;
+      if (prog && ['paused', 'processing'].includes(prog.status)) {
+        setProgress(prog);
+        if (prog.status === 'processing') {
+          setIsProcessing(true);
+          if (!pollRef.current) {
+            pollRef.current = setInterval(() => pollProgress(runId), 2000);
+          }
+        }
+      }
     } catch { /* silent */ }
-  }, []);
+  }, [pollProgress]);
 
   useEffect(() => { fetchRuns(); }, [fetchRuns]);
 
@@ -96,18 +108,24 @@ export default function DashboardPage() {
     try {
       const { data } = await api.get(`/progress/${runId}`);
       setProgress(data);
-      if (data.status === 'completed' || data.status === 'failed' || data.status === 'stale') {
+      if (['completed', 'failed', 'stale', 'paused', 'cancelled'].includes(data.status)) {
         clearInterval(pollRef.current);
         pollRef.current = null;
         setIsProcessing(false);
         if (data.status === 'completed') {
           toast.success('Extraction complete!');
-        } else {
+        } else if (data.status === 'paused') {
+          toast.info('Extraction paused');
+        } else if (data.status === 'cancelled') {
+          toast.info('Extraction cancelled');
+        } else if (data.status === 'failed') {
           toast.error('Processing failed: ' + (data.message || 'Unknown error'));
         }
         await fetchRunData(runId);
         await fetchRuns();
-        setProgress(null);
+        if (data.status === 'completed' || data.status === 'cancelled') {
+          setProgress(null);
+        }
       }
     } catch { /* silent */ }
   }, [fetchRunData, fetchRuns]);
@@ -147,6 +165,39 @@ export default function DashboardPage() {
     }
   };
 
+  const handlePause = async () => {
+    if (!currentRunId) return;
+    try {
+      await api.post(`/runs/${currentRunId}/pause`);
+      toast.info('Pausing after current file...');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to pause');
+    }
+  };
+
+  const handleResume = async () => {
+    if (!currentRunId) return;
+    try {
+      setIsProcessing(true);
+      setProgress(p => ({ ...p, status: 'processing', message: 'Resuming...' }));
+      await api.post(`/extract/${currentRunId}`);
+      pollRef.current = setInterval(() => pollProgress(currentRunId), 2000);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to resume');
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!currentRunId) return;
+    try {
+      await api.post(`/runs/${currentRunId}/cancel`);
+      toast.info('Cancelling extraction...');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to cancel');
+    }
+  };
+
   useEffect(() => {
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
@@ -162,8 +213,8 @@ export default function DashboardPage() {
         <div className="space-y-4">
           <UploadZone files={files} setFiles={setFiles} />
 
-          {/* Progress bar */}
-          {(isProcessing || isUploading) && progress && (
+          {/* Progress bar + controls */}
+          {progress && (progress.status === 'processing' || progress.status === 'paused' || progress.status === 'pausing' || progress.status === 'cancelling') && (
             <div className="bg-[#111827] border border-slate-800 rounded-sm p-4" data-testid="progress-container">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm text-slate-300">{progress.message || 'Processing...'}</span>
@@ -171,13 +222,46 @@ export default function DashboardPage() {
               </div>
               <div className="bg-slate-800 rounded-full h-1.5 overflow-hidden w-full">
                 <div
-                  className="bg-amber-500 h-full transition-all duration-300 ease-out"
-                  style={{ width: `${progress.percentage || 0}%`, boxShadow: '0 0 8px rgba(245,158,11,0.5)' }}
+                  className={`h-full transition-all duration-300 ease-out ${progress.status === 'paused' ? 'bg-sky-400' : 'bg-amber-500'}`}
+                  style={{ width: `${progress.percentage || 0}%`, boxShadow: progress.status === 'paused' ? '0 0 8px rgba(14,165,233,0.5)' : '0 0 8px rgba(245,158,11,0.5)' }}
                 />
               </div>
-              {progress.current_file && (
+              {progress.current_file && progress.status === 'processing' && (
                 <p className="text-xs text-slate-500 mt-2 font-mono">{progress.current_file}</p>
               )}
+              {/* Pause / Resume / Cancel buttons */}
+              <div className="flex items-center gap-2 mt-3">
+                {(progress.status === 'processing' || progress.status === 'pausing') && (
+                  <button
+                    onClick={handlePause}
+                    disabled={progress.status === 'pausing'}
+                    className="bg-transparent border border-sky-500/30 text-sky-400 hover:bg-sky-500 hover:text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-50"
+                    data-testid="pause-extraction-button"
+                  >
+                    <Pause className="h-3.5 w-3.5" />
+                    {progress.status === 'pausing' ? 'Pausing...' : 'Pause'}
+                  </button>
+                )}
+                {progress.status === 'paused' && (
+                  <button
+                    onClick={handleResume}
+                    className="bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2"
+                    data-testid="resume-extraction-button"
+                  >
+                    <Play className="h-3.5 w-3.5" /> Resume
+                  </button>
+                )}
+                {['processing', 'pausing', 'paused'].includes(progress.status) && (
+                  <button
+                    onClick={handleCancel}
+                    disabled={progress.status === 'cancelling'}
+                    className="bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-50"
+                    data-testid="cancel-extraction-button"
+                  >
+                    <XCircle className="h-3.5 w-3.5" /> Cancel
+                  </button>
+                )}
+              </div>
             </div>
           )}
 

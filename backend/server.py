@@ -657,36 +657,44 @@ Document text:
         return [], str(e)
 
 async def process_run(run_id: str, user_id: str):
+    """Process PDFs with pause/resume/cancel support. State is persisted in MongoDB."""
     try:
         settings = await db.settings.find_one({"user_id": user_id}, {"_id": 0})
         if not settings:
             settings = {"exclusion_domain": "horizonc.com"}
-        # Read AI config from admin settings
         admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
         if not admin_config:
             admin_config = {"ai_model": "claude-sonnet"}
         ai_model = admin_config.get("ai_model", "claude-sonnet")
         api_key = get_api_key_for_model(ai_model, admin_config)
         exclusion_domain = settings.get("exclusion_domain", "horizonc.com").lower().strip()
-        files = await db.files.find({"run_id": run_id, "is_deleted": False}, {"_id": 0}).to_list(1000)
-        total_files = len(files)
+
+        all_files = await db.files.find({"run_id": run_id, "is_deleted": False}, {"_id": 0}).to_list(1000)
+        total_files = len(all_files)
         if total_files == 0:
             await db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}})
             return
+
+        # Load checkpoint: which files are already done
+        prog = await db.progress.find_one({"run_id": run_id})
+        completed_ids = set(prog.get("completed_file_ids", [])) if prog else set()
+        pending_files = [f for f in all_files if f["id"] not in completed_ids]
+        processed_count = len(completed_ids)
+
         await db.progress.update_one(
             {"run_id": run_id},
-            {"$set": {"status": "processing", "current_file": "", "total_files": total_files, "processed_files": 0, "percentage": 0, "message": "Starting extraction..."}},
+            {"$set": {
+                "status": "processing", "total_files": total_files,
+                "processed_files": processed_count,
+                "percentage": int(processed_count / total_files * 100),
+                "message": f"{'Resuming' if completed_ids else 'Starting'} extraction ({processed_count}/{total_files} done)..."
+            }},
             upsert=True
         )
-        all_contacts = []
-        error_count = 0
-        processed_count = 0
 
         async def process_single_file(file_record):
-            """Process one PDF file. Returns (contacts_list, errors_list)."""
             filename = file_record["original_filename"]
-            contacts_out = []
-            errors_out = []
+            contacts_out, errors_out = [], []
             try:
                 pdf_bytes = get_object(file_record["storage_path"])
                 if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
@@ -715,35 +723,83 @@ async def process_run(run_id: str, user_id: str):
                 errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
                 return contacts_out, errors_out, True
 
-        CONCURRENT = 3  # AI calls in parallel per batch
-        for i in range(0, total_files, BATCH_SIZE):
-            batch = files[i:i + BATCH_SIZE]
-            # Process batch in sub-groups of CONCURRENT
-            for j in range(0, len(batch), CONCURRENT):
-                sub = batch[j:j + CONCURRENT]
-                names = ", ".join(f["original_filename"] for f in sub)
+        CONCURRENT = 3
+        stopped = False
+        for i in range(0, len(pending_files), CONCURRENT):
+            # --- Check for pause/cancel BEFORE each sub-batch ---
+            run_doc = await db.runs.find_one({"id": run_id}, {"_id": 0, "status": 1})
+            if run_doc and run_doc.get("status") == "pausing":
+                await db.runs.update_one({"id": run_id}, {"$set": {"status": "paused"}})
+                await db.progress.update_one({"run_id": run_id}, {"$set": {
+                    "status": "paused", "message": f"Paused at {processed_count}/{total_files} files"
+                }})
+                logger.info(f"Run {run_id} paused at {processed_count}/{total_files}")
+                stopped = True
+                break
+            if run_doc and run_doc.get("status") == "cancelling":
+                await db.runs.update_one({"id": run_id}, {"$set": {"status": "cancelled"}})
+                await db.progress.update_one({"run_id": run_id}, {"$set": {
+                    "status": "cancelled", "message": "Extraction cancelled by user"
+                }})
+                # Clean up ALL extracted data for this run
+                await db.raw_contacts.delete_many({"run_id": run_id})
+                await db.contacts.delete_many({"run_id": run_id})
+                await db.processing_errors.delete_many({"run_id": run_id})
+                await db.duplicates.delete_many({"run_id": run_id})
+                logger.info(f"Run {run_id} cancelled and cleaned up")
+                stopped = True
+                break
+
+            sub = pending_files[i:i + CONCURRENT]
+            names = ", ".join(f["original_filename"] for f in sub)
+            await db.progress.update_one(
+                {"run_id": run_id},
+                {"$set": {"current_file": names, "processed_files": processed_count,
+                          "percentage": int(processed_count / total_files * 100),
+                          "message": f"Processing {len(sub)} files ({processed_count}/{total_files})..."}}
+            )
+            tasks = [process_single_file(fr) for fr in sub]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            new_file_ids = []
+            for idx, result in enumerate(results):
+                file_id = sub[idx]["id"] if idx < len(sub) else None
+                if isinstance(result, Exception):
+                    processed_count += 1
+                    if file_id:
+                        new_file_ids.append(file_id)
+                    continue
+                file_contacts, file_errors, is_error = result
+                # Save raw contacts immediately (survives pause/restart)
+                if file_contacts:
+                    raw_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                                 **c, "created_at": datetime.now(timezone.utc).isoformat()} for c in file_contacts]
+                    await db.raw_contacts.insert_many(raw_docs)
+                if file_errors:
+                    err_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                                 **e, "created_at": datetime.now(timezone.utc).isoformat()} for e in file_errors]
+                    await db.processing_errors.insert_many(err_docs)
+                processed_count += 1
+                if file_id:
+                    new_file_ids.append(file_id)
+
+            # Persist checkpoint
+            if new_file_ids:
                 await db.progress.update_one(
                     {"run_id": run_id},
-                    {"$set": {"current_file": names, "processed_files": processed_count, "percentage": int(processed_count / total_files * 100), "message": f"Processing {len(sub)} files ({processed_count}/{total_files})..."}}
+                    {"$push": {"completed_file_ids": {"$each": new_file_ids}},
+                     "$set": {"processed_files": processed_count,
+                              "percentage": int(processed_count / total_files * 100)}}
                 )
-                tasks = [process_single_file(fr) for fr in sub]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, Exception):
-                        error_count += 1
-                        processed_count += 1
-                        continue
-                    file_contacts, file_errors, is_error = result
-                    all_contacts.extend(file_contacts)
-                    if file_errors:
-                        err_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id, **e, "created_at": datetime.now(timezone.utc).isoformat()} for e in file_errors]
-                        await db.processing_errors.insert_many(err_docs)
-                    if is_error:
-                        error_count += 1
-                    processed_count += 1
 
-        # Post-processing
-        total_extracted = len(all_contacts)
+        if stopped:
+            return
+
+        # === ALL FILES DONE — run post-processing ===
+        all_raw = await db.raw_contacts.find({"run_id": run_id, "user_id": user_id}, {"_id": 0}).to_list(10000)
+        total_extracted = len(all_raw)
+        all_contacts = all_raw
+
         excluded_internal = 0
         if exclusion_domain:
             filtered = []
@@ -753,6 +809,7 @@ async def process_run(run_id: str, user_id: str):
                 else:
                     filtered.append(c)
             all_contacts = filtered
+
         excluded_no_contact = 0
         filtered = []
         for c in all_contacts:
@@ -761,6 +818,7 @@ async def process_run(run_id: str, user_id: str):
             else:
                 filtered.append(c)
         all_contacts = filtered
+
         seen_emails = {}
         duplicates_removed = 0
         duplicate_records = []
@@ -774,12 +832,9 @@ async def process_run(run_id: str, user_id: str):
                     "email": email,
                     "kept_source": seen_emails[email].get("source_filename", ""),
                     "duplicate_source": c.get("source_filename", ""),
-                    "first_name": c.get("first_name", ""),
-                    "last_name": c.get("last_name", ""),
-                    "company": c.get("company", ""),
-                    "city": c.get("city", ""),
-                    "state": c.get("state", ""),
-                    "phone": c.get("phone", ""),
+                    "first_name": c.get("first_name", ""), "last_name": c.get("last_name", ""),
+                    "company": c.get("company", ""), "city": c.get("city", ""),
+                    "state": c.get("state", ""), "phone": c.get("phone", ""),
                     "created_at": datetime.now(timezone.utc).isoformat()
                 })
             else:
@@ -787,40 +842,36 @@ async def process_run(run_id: str, user_id: str):
                     seen_emails[email] = c
                 unique_contacts.append(c)
         all_contacts = unique_contacts
+
+        # Clear old final data and write fresh
+        await db.contacts.delete_many({"run_id": run_id})
+        await db.duplicates.delete_many({"run_id": run_id})
         if duplicate_records:
             await db.duplicates.insert_many(duplicate_records)
         if all_contacts:
-            contact_docs = [{
-                "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                **c, "created_at": datetime.now(timezone.utc).isoformat()
-            } for c in all_contacts]
+            contact_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                             **{k: v for k, v in c.items() if k not in ("id", "run_id", "user_id")},
+                             "created_at": datetime.now(timezone.utc).isoformat()} for c in all_contacts]
             await db.contacts.insert_many(contact_docs)
+
+        error_count = await db.processing_errors.count_documents({"run_id": run_id})
         stats = {
-            "total_pdfs": total_files,
-            "processed": total_files - error_count,
-            "errors": error_count,
-            "contacts_extracted": total_extracted,
+            "total_pdfs": total_files, "processed": total_files - error_count,
+            "errors": error_count, "contacts_extracted": total_extracted,
             "duplicates_removed": duplicates_removed,
             "excluded_no_contact": excluded_no_contact,
             "excluded_internal": excluded_internal,
             "net_new": len(all_contacts)
         }
-        await db.runs.update_one(
-            {"id": run_id},
-            {"$set": {"status": "completed", "stats": stats, "completed_at": datetime.now(timezone.utc).isoformat()}}
-        )
-        await db.progress.update_one(
-            {"run_id": run_id},
-            {"$set": {"status": "completed", "percentage": 100, "processed_files": total_files, "message": "Extraction complete!"}}
-        )
+        await db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "stats": stats, "completed_at": datetime.now(timezone.utc).isoformat()}})
+        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "completed", "percentage": 100, "processed_files": total_files, "message": "Extraction complete!"}})
+        # Clean up raw contacts
+        await db.raw_contacts.delete_many({"run_id": run_id})
         logger.info(f"Run {run_id} completed: {len(all_contacts)} contacts from {total_files} files")
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
         await db.runs.update_one({"id": run_id}, {"$set": {"status": "failed"}})
-        await db.progress.update_one(
-            {"run_id": run_id},
-            {"$set": {"status": "failed", "message": f"Processing failed: {str(e)}"}}
-        )
+        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "failed", "message": f"Processing failed: {str(e)}"}})
 
 @api_router.post("/extract/{run_id}")
 async def start_extraction(run_id: str, request: Request):
@@ -828,21 +879,61 @@ async def start_extraction(run_id: str, request: Request):
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    # Allow retry on stuck "processing" or "stale" runs (server restart killed the task)
+    # Allow retry/resume on stale, paused, or failed runs
     if run["status"] in ("processing", "stale"):
-        # Check if it's actually stale (no progress update in 2 min)
         prog = await db.progress.find_one({"run_id": run_id}, {"_id": 0})
         if prog and prog.get("status") == "processing":
-            logger.info(f"Retrying stale run {run_id}")
-            # Clean up previous partial data so we re-process from scratch
-            await db.contacts.delete_many({"run_id": run_id})
-            await db.processing_errors.delete_many({"run_id": run_id})
-            await db.duplicates.delete_many({"run_id": run_id})
-        else:
             raise HTTPException(status_code=400, detail="Run is already being processed")
+    if run["status"] == "paused":
+        logger.info(f"Resuming paused run {run_id}")
+    elif run["status"] in ("stale", "failed"):
+        logger.info(f"Retrying {run['status']} run {run_id}")
+        # Clean up previous final data but keep raw_contacts + errors for resume
+        await db.contacts.delete_many({"run_id": run_id})
+        await db.duplicates.delete_many({"run_id": run_id})
+    elif run["status"] == "uploaded":
+        pass  # Fresh start
+    elif run["status"] == "completed":
+        raise HTTPException(status_code=400, detail="Run already completed")
+    elif run["status"] == "cancelled":
+        raise HTTPException(status_code=400, detail="Run was cancelled. Upload new files to start again.")
+    else:
+        raise HTTPException(status_code=400, detail=f"Cannot extract from status: {run['status']}")
     await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing"}})
     asyncio.create_task(process_run(run_id, user["_id"]))
     return {"message": "Extraction started", "run_id": run_id}
+
+@api_router.post("/runs/{run_id}/pause")
+async def pause_run(run_id: str, request: Request):
+    user = await get_current_user(request)
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] != "processing":
+        raise HTTPException(status_code=400, detail="Can only pause a processing run")
+    await db.runs.update_one({"id": run_id}, {"$set": {"status": "pausing"}})
+    return {"message": "Pause signal sent — will pause after current file completes"}
+
+@api_router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, request: Request):
+    user = await get_current_user(request)
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] not in ("processing", "paused", "pausing"):
+        raise HTTPException(status_code=400, detail="Can only cancel a processing or paused run")
+    if run["status"] == "paused":
+        # Directly cancel since no background task is running
+        await db.runs.update_one({"id": run_id}, {"$set": {"status": "cancelled"}})
+        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "cancelled", "message": "Extraction cancelled by user"}})
+        await db.raw_contacts.delete_many({"run_id": run_id})
+        await db.contacts.delete_many({"run_id": run_id})
+        await db.processing_errors.delete_many({"run_id": run_id})
+        await db.duplicates.delete_many({"run_id": run_id})
+        return {"message": "Run cancelled and data cleared"}
+    # Signal the background task
+    await db.runs.update_one({"id": run_id}, {"$set": {"status": "cancelling"}})
+    return {"message": "Cancel signal sent — will cancel after current file completes"}
 
 @api_router.get("/progress/{run_id}")
 async def get_progress(run_id: str, request: Request):
@@ -985,6 +1076,7 @@ async def startup():
     await db.files.create_index("run_id")
     await db.progress.create_index("run_id")
     await db.duplicates.create_index("run_id")
+    await db.raw_contacts.create_index("run_id")
     # Recover stale "processing" runs from server restarts
     stale = await db.runs.count_documents({"status": "processing"})
     if stale > 0:

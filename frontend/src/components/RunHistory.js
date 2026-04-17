@@ -89,6 +89,8 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                   <div className={`w-2 h-2 rounded-full shrink-0 ${
                     run.status === 'completed' ? 'bg-emerald-400' :
                     run.status === 'processing' ? 'bg-amber-400 animate-pulse' :
+                    run.status === 'paused' ? 'bg-sky-400' :
+                    run.status === 'cancelled' ? 'bg-slate-400' :
                     run.status === 'stale' ? 'bg-orange-400' :
                     run.status === 'failed' ? 'bg-red-400' : 'bg-slate-500'
                   }`} />
@@ -127,14 +129,15 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                       )}
                     </>
                   )}
-                  {(run.status === 'stale' || run.status === 'failed') && (
+                  {(run.status === 'stale' || run.status === 'failed' || run.status === 'paused') && (
                     <button
                       onClick={(e) => handleRetry(e, run.id)}
                       disabled={retrying === run.id}
                       className="text-xs bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500 hover:text-white rounded-sm px-3 py-1 transition-colors inline-flex items-center gap-1 disabled:opacity-50"
                       data-testid={`retry-run-${run.id}`}
                     >
-                      <RotateCcw className={`h-3 w-3 ${retrying === run.id ? 'animate-spin' : ''}`} /> Retry
+                      <RotateCcw className={`h-3 w-3 ${retrying === run.id ? 'animate-spin' : ''}`} />
+                      {run.status === 'paused' ? 'Resume' : 'Retry'}
                     </button>
                   )}
                   <button
