@@ -605,81 +605,64 @@ async def process_run(run_id: str, user_id: str):
         error_count = 0
         processed_count = 0
 
+        async def process_single_file(file_record):
+            """Process one PDF file. Returns (contacts_list, errors_list)."""
+            filename = file_record["original_filename"]
+            contacts_out = []
+            errors_out = []
+            try:
+                pdf_bytes = get_object(file_record["storage_path"])
+                if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
+                    pdf_bytes = compress_pdf(pdf_bytes, filename)
+                text, text_error = await extract_text_from_pdf(pdf_bytes, filename)
+                if text_error and not text_error.get("partial", False):
+                    errors_out.append({"filename": filename, "reason": text_error["reason"], "missing_fields": text_error.get("missing_fields", "")})
+                    return contacts_out, errors_out, True
+                contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
+                if ai_error and not contacts:
+                    errors_out.append({"filename": filename, "reason": f"AI extraction failed: {ai_error}", "missing_fields": "All fields"})
+                    return contacts_out, errors_out, True
+                if not contacts:
+                    errors_out.append({"filename": filename, "reason": "No contact information found in document", "missing_fields": "All fields"})
+                for contact in contacts:
+                    missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
+                    if missing and len(missing) >= 4:
+                        errors_out.append({"filename": filename, "reason": "Incomplete extraction - most fields missing", "missing_fields": ", ".join(missing)})
+                    contact["source_filename"] = filename
+                    contacts_out.append(contact)
+                if text_error and text_error.get("partial"):
+                    errors_out.append({"filename": filename, "reason": text_error["reason"], "missing_fields": "Possible inaccuracies in all fields"})
+                return contacts_out, errors_out, bool(errors_out and not contacts)
+            except Exception as e:
+                logger.error(f"Error processing {filename}: {e}")
+                errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
+                return contacts_out, errors_out, True
+
+        CONCURRENT = 3  # AI calls in parallel per batch
         for i in range(0, total_files, BATCH_SIZE):
             batch = files[i:i + BATCH_SIZE]
-            for file_record in batch:
-                filename = file_record["original_filename"]
+            # Process batch in sub-groups of CONCURRENT
+            for j in range(0, len(batch), CONCURRENT):
+                sub = batch[j:j + CONCURRENT]
+                names = ", ".join(f["original_filename"] for f in sub)
                 await db.progress.update_one(
                     {"run_id": run_id},
-                    {"$set": {"current_file": filename, "processed_files": processed_count, "percentage": int(processed_count / total_files * 100), "message": f"Processing {filename}..."}}
+                    {"$set": {"current_file": names, "processed_files": processed_count, "percentage": int(processed_count / total_files * 100), "message": f"Processing {len(sub)} files ({processed_count}/{total_files})..."}}
                 )
-                try:
-                    pdf_bytes = get_object(file_record["storage_path"])
-                    # Compress large PDFs before processing
-                    if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
-                        pdf_bytes = compress_pdf(pdf_bytes, filename)
-                    text, text_error = await extract_text_from_pdf(pdf_bytes, filename)
-                    if text_error and not text_error.get("partial", False):
-                        await db.processing_errors.insert_one({
-                            "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                            "filename": filename, "reason": text_error["reason"],
-                            "missing_fields": text_error.get("missing_fields", ""),
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        })
+                tasks = [process_single_file(fr) for fr in sub]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
                         error_count += 1
                         processed_count += 1
                         continue
-                    contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
-                    if ai_error and not contacts:
-                        await db.processing_errors.insert_one({
-                            "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                            "filename": filename, "reason": f"AI extraction failed: {ai_error}",
-                            "missing_fields": "All fields",
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        })
+                    file_contacts, file_errors, is_error = result
+                    all_contacts.extend(file_contacts)
+                    if file_errors:
+                        err_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id, **e, "created_at": datetime.now(timezone.utc).isoformat()} for e in file_errors]
+                        await db.processing_errors.insert_many(err_docs)
+                    if is_error:
                         error_count += 1
-                        processed_count += 1
-                        continue
-                    if not contacts:
-                        await db.processing_errors.insert_one({
-                            "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                            "filename": filename, "reason": "No contact information found in document",
-                            "missing_fields": "All fields",
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        })
-                        error_count += 1
-                    for contact in contacts:
-                        missing = []
-                        for f in ["email", "phone", "city", "state", "company"]:
-                            if not contact.get(f):
-                                missing.append(f.capitalize())
-                        if missing and len(missing) >= 4:
-                            await db.processing_errors.insert_one({
-                                "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                                "filename": filename, "reason": "Incomplete extraction - most fields missing",
-                                "missing_fields": ", ".join(missing),
-                                "created_at": datetime.now(timezone.utc).isoformat()
-                            })
-                        contact["source_filename"] = filename
-                        all_contacts.append(contact)
-                    if text_error and text_error.get("partial"):
-                        await db.processing_errors.insert_one({
-                            "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                            "filename": filename, "reason": text_error["reason"],
-                            "missing_fields": "Possible inaccuracies in all fields",
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        })
-                        error_count += 1
-                    processed_count += 1
-                except Exception as e:
-                    logger.error(f"Error processing {filename}: {e}")
-                    await db.processing_errors.insert_one({
-                        "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                        "filename": filename, "reason": f"Processing error: {str(e)}",
-                        "missing_fields": "All fields",
-                        "created_at": datetime.now(timezone.utc).isoformat()
-                    })
-                    error_count += 1
                     processed_count += 1
 
         # Post-processing
@@ -768,8 +751,18 @@ async def start_extraction(run_id: str, request: Request):
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] == "processing":
-        raise HTTPException(status_code=400, detail="Run is already being processed")
+    # Allow retry on stuck "processing" or "stale" runs (server restart killed the task)
+    if run["status"] in ("processing", "stale"):
+        # Check if it's actually stale (no progress update in 2 min)
+        prog = await db.progress.find_one({"run_id": run_id}, {"_id": 0})
+        if prog and prog.get("status") == "processing":
+            logger.info(f"Retrying stale run {run_id}")
+            # Clean up previous partial data so we re-process from scratch
+            await db.contacts.delete_many({"run_id": run_id})
+            await db.processing_errors.delete_many({"run_id": run_id})
+            await db.duplicates.delete_many({"run_id": run_id})
+        else:
+            raise HTTPException(status_code=400, detail="Run is already being processed")
     await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing"}})
     asyncio.create_task(process_run(run_id, user["_id"]))
     return {"message": "Extraction started", "run_id": run_id}
@@ -915,6 +908,12 @@ async def startup():
     await db.files.create_index("run_id")
     await db.progress.create_index("run_id")
     await db.duplicates.create_index("run_id")
+    # Recover stale "processing" runs from server restarts
+    stale = await db.runs.count_documents({"status": "processing"})
+    if stale > 0:
+        await db.runs.update_many({"status": "processing"}, {"$set": {"status": "stale"}})
+        await db.progress.update_many({"status": "processing"}, {"$set": {"status": "stale", "message": "Processing interrupted — click Retry to resume"}})
+        logger.warning(f"Marked {stale} stale processing runs for retry")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trueflow.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "TrueFlow2024!")

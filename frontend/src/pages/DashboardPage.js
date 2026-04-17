@@ -85,11 +85,18 @@ export default function DashboardPage() {
     }
   };
 
+  const retryRun = (runId) => {
+    setCurrentRunId(runId);
+    setIsProcessing(true);
+    setProgress({ status: 'processing', percentage: 0, message: 'Restarting extraction...' });
+    pollRef.current = setInterval(() => pollProgress(runId), 2000);
+  };
+
   const pollProgress = useCallback(async (runId) => {
     try {
       const { data } = await api.get(`/progress/${runId}`);
       setProgress(data);
-      if (data.status === 'completed' || data.status === 'failed') {
+      if (data.status === 'completed' || data.status === 'failed' || data.status === 'stale') {
         clearInterval(pollRef.current);
         pollRef.current = null;
         setIsProcessing(false);
@@ -233,7 +240,7 @@ export default function DashboardPage() {
             <ErrorsTable errors={errors} runId={currentRunId} />
           </TabsContent>
           <TabsContent value="history" className="mt-4 animate-fade-in">
-            <RunHistory runs={runs} onSelectRun={selectRun} onDeleteRun={deleteRun} currentRunId={currentRunId} />
+            <RunHistory runs={runs} onSelectRun={selectRun} onDeleteRun={deleteRun} onRetryRun={retryRun} currentRunId={currentRunId} />
           </TabsContent>
         </Tabs>
       </main>

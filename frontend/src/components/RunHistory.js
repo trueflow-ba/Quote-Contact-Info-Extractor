@@ -1,12 +1,13 @@
 import { useState } from 'react';
-import { Calendar, Download, FileText, CheckCircle, AlertTriangle, Trash2 } from 'lucide-react';
+import { Calendar, Download, FileText, CheckCircle, AlertTriangle, Trash2, RotateCcw } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import api from '@/lib/api';
 import { toast } from 'sonner';
 
-export default function RunHistory({ runs, onSelectRun, onDeleteRun, currentRunId }) {
+export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun, currentRunId }) {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [deleting, setDeleting] = useState(false);
+  const [retrying, setRetrying] = useState(null);
 
   const downloadCSV = async (e, runId, type) => {
     e.stopPropagation();
@@ -39,6 +40,19 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, currentRunI
     }
     setDeleting(false);
     setConfirmDelete(null);
+  };
+
+  const handleRetry = async (e, runId) => {
+    e.stopPropagation();
+    setRetrying(runId);
+    try {
+      await api.post(`/extract/${runId}`);
+      toast.success('Extraction restarted');
+      if (onRetryRun) onRetryRun(runId);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to retry');
+    }
+    setRetrying(null);
   };
 
   const formatDate = (iso) => {
@@ -75,6 +89,7 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, currentRunI
                   <div className={`w-2 h-2 rounded-full shrink-0 ${
                     run.status === 'completed' ? 'bg-emerald-400' :
                     run.status === 'processing' ? 'bg-amber-400 animate-pulse' :
+                    run.status === 'stale' ? 'bg-orange-400' :
                     run.status === 'failed' ? 'bg-red-400' : 'bg-slate-500'
                   }`} />
                   <div>
@@ -111,6 +126,16 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, currentRunI
                         </button>
                       )}
                     </>
+                  )}
+                  {(run.status === 'stale' || run.status === 'failed') && (
+                    <button
+                      onClick={(e) => handleRetry(e, run.id)}
+                      disabled={retrying === run.id}
+                      className="text-xs bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500 hover:text-white rounded-sm px-3 py-1 transition-colors inline-flex items-center gap-1 disabled:opacity-50"
+                      data-testid={`retry-run-${run.id}`}
+                    >
+                      <RotateCcw className={`h-3 w-3 ${retrying === run.id ? 'animate-spin' : ''}`} /> Retry
+                    </button>
                   )}
                   <button
                     onClick={(e) => { e.stopPropagation(); setConfirmDelete(run.id); }}
