@@ -112,6 +112,29 @@ export default function ContactsTable({ contacts, runId }) {
     }
   };
 
+  const downloadGroupedCSV = () => {
+    if (!groupedData?.length) return;
+    const headers = ['Company', 'Bid By', 'Count', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State'];
+    const escapeCSV = (val) => {
+      const s = String(val ?? '');
+      return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const rows = groupedData.map(c =>
+      [c.company, c.bid_by, c.count, c.first_name, c.last_name, c.email, c.phone, c.city, c.state].map(escapeCSV).join(',')
+    );
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `contacts_grouped_${runId ? runId.slice(0, 8) : 'export'}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast.success('Grouped CSV downloaded');
+  };
+
   if (!contacts?.length) {
     return (
       <div className="text-center py-16 text-slate-500 text-sm" data-testid="contacts-empty">
@@ -155,12 +178,21 @@ export default function ContactsTable({ contacts, runId }) {
               : `${filtered.length} contacts`
             }
           </span>
+          {grouped && (
+            <button
+              onClick={downloadGroupedCSV}
+              className="bg-purple-500/15 border border-purple-500/30 text-purple-300 hover:bg-purple-500 hover:text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2"
+              data-testid="download-grouped-csv-button"
+            >
+              <Download className="h-3.5 w-3.5" /> Grouped CSV
+            </button>
+          )}
           <button
             onClick={downloadCSV}
             className="bg-sky-500 hover:bg-sky-600 text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2"
             data-testid="download-csv-button"
           >
-            <Download className="h-3.5 w-3.5" /> Download CSV
+            <Download className="h-3.5 w-3.5" /> {grouped ? 'Full CSV' : 'Download CSV'}
           </button>
         </div>
       </div>
