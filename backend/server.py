@@ -819,6 +819,7 @@ async def process_run(run_id: str, user_id: str):
                 filtered.append(c)
         all_contacts = filtered
 
+        # Dedup within this run
         seen_emails = {}
         duplicates_removed = 0
         duplicate_records = []
@@ -843,7 +844,40 @@ async def process_run(run_id: str, user_id: str):
                 unique_contacts.append(c)
         all_contacts = unique_contacts
 
-        # Clear old final data and write fresh
+        # Cross-run dedup: check against contacts from ALL previous completed runs
+        existing_emails = set()
+        prev_contacts = await db.contacts.find(
+            {"user_id": user_id, "run_id": {"$ne": run_id}},
+            {"_id": 0, "email": 1}
+        ).to_list(50000)
+        for pc in prev_contacts:
+            em = (pc.get("email") or "").lower().strip()
+            if em:
+                existing_emails.add(em)
+
+        cross_run_dupes = 0
+        new_contacts = []
+        for c in all_contacts:
+            email = c.get("email", "").lower().strip()
+            if email and email in existing_emails:
+                cross_run_dupes += 1
+                duplicate_records.append({
+                    "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                    "email": email,
+                    "kept_source": "(previous run)",
+                    "duplicate_source": c.get("source_filename", ""),
+                    "first_name": c.get("first_name", ""), "last_name": c.get("last_name", ""),
+                    "company": c.get("company", ""), "city": c.get("city", ""),
+                    "state": c.get("state", ""), "phone": c.get("phone", ""),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                })
+            else:
+                new_contacts.append(c)
+                if email:
+                    existing_emails.add(email)  # prevent dupes within new_contacts too
+        all_contacts = new_contacts
+
+        # Write final data — only for THIS run, never touch other runs
         await db.contacts.delete_many({"run_id": run_id})
         await db.duplicates.delete_many({"run_id": run_id})
         if duplicate_records:
@@ -858,7 +892,8 @@ async def process_run(run_id: str, user_id: str):
         stats = {
             "total_pdfs": total_files, "processed": total_files - error_count,
             "errors": error_count, "contacts_extracted": total_extracted,
-            "duplicates_removed": duplicates_removed,
+            "duplicates_removed": duplicates_removed + cross_run_dupes,
+            "cross_run_duplicates": cross_run_dupes,
             "excluded_no_contact": excluded_no_contact,
             "excluded_internal": excluded_internal,
             "net_new": len(all_contacts)

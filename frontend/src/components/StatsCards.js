@@ -1,15 +1,16 @@
-import { FileText, AlertTriangle, CheckCircle, Users, MinusCircle, Copy, Ban, TrendingUp } from 'lucide-react';
+import { FileText, AlertTriangle, CheckCircle, Users, MinusCircle, Copy, Ban, TrendingUp, GitMerge } from 'lucide-react';
 
 const statConfig = [
   { key: 'total_pdfs', label: 'Total PDFs', icon: FileText, color: 'text-sky-400' },
   { key: 'processed', label: 'Processed', icon: CheckCircle, color: 'text-emerald-400' },
   { key: 'errors', label: 'Errors', icon: AlertTriangle, color: 'text-red-400' },
-  { key: 'net_new', label: 'Net Contacts', icon: TrendingUp, color: 'text-amber-400' },
+  { key: 'net_new', label: 'Net New Contacts', icon: TrendingUp, color: 'text-amber-400' },
 ];
 
 const detailStats = [
   { key: 'contacts_extracted', label: 'Total Extracted', icon: Users },
-  { key: 'duplicates_removed', label: 'Duplicates', icon: Copy },
+  { key: 'duplicates_removed', label: 'Duplicates (all)', icon: Copy },
+  { key: 'cross_run_duplicates', label: 'Already in Prior Runs', icon: GitMerge },
   { key: 'excluded_no_contact', label: 'No Contact Info', icon: MinusCircle },
   { key: 'excluded_internal', label: 'Internal Excluded', icon: Ban },
 ];
@@ -34,7 +35,7 @@ export default function StatsCards({ stats }) {
 
       {/* Detail stats row */}
       {s.contacts_extracted > 0 && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mt-3">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 md:gap-4 mt-3">
           {detailStats.map(({ key, label, icon: Icon }) => (
             <div key={key} className="bg-[#111827]/50 border border-slate-800/50 rounded-sm px-4 py-3 flex items-center gap-3">
               <Icon className="h-3.5 w-3.5 text-slate-500" strokeWidth={1.5} />
