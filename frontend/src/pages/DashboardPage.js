@@ -9,6 +9,7 @@ import UploadZone from '@/components/UploadZone';
 import ContactsTable from '@/components/ContactsTable';
 import ErrorsTable from '@/components/ErrorsTable';
 import DuplicatesTable from '@/components/DuplicatesTable';
+import AllContactsTable from '@/components/AllContactsTable';
 import RunHistory from '@/components/RunHistory';
 import DataViz from '@/components/DataViz';
 
@@ -253,10 +254,13 @@ export default function DashboardPage() {
 
         <DataViz chartData={chartData} />
 
-        <Tabs defaultValue="results" className="w-full">
+        <Tabs defaultValue="all" className="w-full">
           <TabsList className="bg-[#111827] border border-slate-800 p-1 h-auto rounded-sm flex-wrap">
+            <TabsTrigger value="all" className="text-sm data-[state=active]:bg-emerald-500/10 data-[state=active]:text-emerald-400 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5" data-testid="tab-all-contacts">
+              All Contacts
+            </TabsTrigger>
             <TabsTrigger value="results" className="text-sm data-[state=active]:bg-sky-500/10 data-[state=active]:text-sky-400 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5" data-testid="tab-results">
-              Results {contacts.length > 0 && `(${contacts.length})`}
+              This Run {contacts.length > 0 && `(${contacts.length})`}
             </TabsTrigger>
             <TabsTrigger value="duplicates" className="text-sm data-[state=active]:bg-purple-500/10 data-[state=active]:text-purple-400 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5" data-testid="tab-duplicates">
               Duplicates {duplicates.length > 0 && `(${duplicates.length})`}
@@ -268,6 +272,7 @@ export default function DashboardPage() {
               Run History {runs.length > 0 && `(${runs.length})`}
             </TabsTrigger>
           </TabsList>
+          <TabsContent value="all" className="mt-4 animate-fade-in"><AllContactsTable /></TabsContent>
           <TabsContent value="results" className="mt-4 animate-fade-in"><ContactsTable contacts={contacts} runId={currentRunId} /></TabsContent>
           <TabsContent value="duplicates" className="mt-4 animate-fade-in"><DuplicatesTable duplicates={duplicates} /></TabsContent>
           <TabsContent value="issues" className="mt-4 animate-fade-in"><ErrorsTable errors={errors} runId={currentRunId} /></TabsContent>

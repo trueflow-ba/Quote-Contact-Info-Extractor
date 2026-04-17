@@ -1030,6 +1030,76 @@ async def get_run_charts(run_id: str, request: Request):
     state_data = sorted([{"name": k, "count": v} for k, v in state_counts.items()], key=lambda x: -x["count"])[:20]
     return {"by_city": city_data, "by_state": state_data}
 
+@api_router.get("/contacts/all")
+async def get_all_contacts(request: Request):
+    """Get all unique contacts across all runs for this user, with import date."""
+    user = await get_current_user(request)
+    contacts = await db.contacts.find({"user_id": user["_id"]}, {"_id": 0}).sort("created_at", 1).to_list(50000)
+    # Attach run date as import_date from the run's created_at
+    run_dates = {}
+    runs = await db.runs.find({"user_id": user["_id"]}, {"_id": 0, "id": 1, "created_at": 1}).to_list(500)
+    for r in runs:
+        run_dates[r["id"]] = r.get("created_at", "")
+    for c in contacts:
+        c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
+    return contacts
+
+@api_router.get("/contacts/all/charts")
+async def get_all_contacts_charts(request: Request):
+    user = await get_current_user(request)
+    contacts = await db.contacts.find({"user_id": user["_id"]}, {"_id": 0}).to_list(50000)
+    city_counts = {}
+    state_counts = {}
+    for c in contacts:
+        city = c.get("city", "").strip()
+        state = c.get("state", "").strip()
+        if city:
+            city_counts[city] = city_counts.get(city, 0) + 1
+        if state:
+            state_counts[state] = state_counts.get(state, 0) + 1
+    city_data = sorted([{"name": k, "count": v} for k, v in city_counts.items()], key=lambda x: -x["count"])[:20]
+    state_data = sorted([{"name": k, "count": v} for k, v in state_counts.items()], key=lambda x: -x["count"])[:20]
+    return {"by_city": city_data, "by_state": state_data}
+
+class CsvExportInput(BaseModel):
+    fields: List[str]
+    run_id: Optional[str] = None  # None = all contacts
+
+@api_router.post("/contacts/download")
+async def download_custom_csv(input: CsvExportInput, request: Request):
+    """Download CSV with user-selected fields. run_id=null means all contacts."""
+    user = await get_current_user(request)
+    query = {"user_id": user["_id"]}
+    if input.run_id:
+        query["run_id"] = input.run_id
+    contacts = await db.contacts.find(query, {"_id": 0}).sort("created_at", 1).to_list(50000)
+    # Map import_date
+    run_dates = {}
+    runs = await db.runs.find({"user_id": user["_id"]}, {"_id": 0, "id": 1, "created_at": 1}).to_list(500)
+    for r in runs:
+        run_dates[r["id"]] = r.get("created_at", "")
+    field_map = {
+        "city": "City", "state": "State", "bid_by": "Bid By", "company": "Company",
+        "last_name": "Last Name", "first_name": "First Name", "email": "Email",
+        "phone": "Phone", "source_filename": "Source File", "import_date": "Import Date",
+        "run_id": "Run ID",
+    }
+    headers = [field_map.get(f, f) for f in input.fields]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    for c in contacts:
+        c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
+        row = [c.get(f, "") for f in input.fields]
+        writer.writerow(row)
+    output.seek(0)
+    fname = f"contacts_{input.run_id[:8] if input.run_id else 'all'}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"}
+    )
+
 @api_router.get("/runs/{run_id}/download/contacts")
 async def download_contacts_csv(run_id: str, request: Request):
     user = await get_current_user(request)
