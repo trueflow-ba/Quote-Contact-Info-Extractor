@@ -5,8 +5,9 @@ import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import LoginPage from "@/pages/LoginPage";
 import DashboardPage from "@/pages/DashboardPage";
 import SettingsPage from "@/pages/SettingsPage";
+import AdminPage from "@/pages/AdminPage";
 
-function ProtectedRoute({ children }) {
+function ProtectedRoute({ children, adminOnly }) {
   const { user, loading } = useAuth();
   if (loading) {
     return (
@@ -16,6 +17,11 @@ function ProtectedRoute({ children }) {
     );
   }
   if (!user) return <Navigate to="/login" replace />;
+  // Force password change for admin on first login
+  if (user.must_change_password && window.location.pathname !== '/admin') {
+    return <Navigate to="/admin" replace />;
+  }
+  if (adminOnly && user.role !== 'admin') return <Navigate to="/" replace />;
   return children;
 }
 
@@ -30,9 +36,10 @@ function AppRoutes() {
   }
   return (
     <Routes>
-      <Route path="/login" element={user ? <Navigate to="/" replace /> : <LoginPage />} />
+      <Route path="/login" element={user ? (user.must_change_password ? <Navigate to="/admin" replace /> : <Navigate to="/" replace />) : <LoginPage />} />
       <Route path="/" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
+      <Route path="/admin" element={<ProtectedRoute adminOnly><AdminPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

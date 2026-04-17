@@ -37,8 +37,12 @@ export function AuthProvider({ children }) {
     setUser(false);
   };
 
+  const clearMustChangePassword = () => {
+    setUser(prev => prev ? { ...prev, must_change_password: false } : prev);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, register, logout, clearMustChangePassword }}>
       {children}
     </AuthContext.Provider>
   );

@@ -1,7 +1,7 @@
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { LayoutDashboard, Settings, LogOut, User, ChevronDown } from 'lucide-react';
+import { LayoutDashboard, Settings, LogOut, User, ChevronDown, Shield } from 'lucide-react';
 
 export default function Header() {
   const { user, logout } = useAuth();
@@ -16,6 +16,7 @@ export default function Header() {
   const navItems = [
     { path: '/', label: 'Dashboard', icon: LayoutDashboard },
     { path: '/settings', label: 'Settings', icon: Settings },
+    ...(user?.role === 'admin' ? [{ path: '/admin', label: 'Admin', icon: Shield }] : []),
   ];
 
   return (

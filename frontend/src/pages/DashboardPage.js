@@ -127,7 +127,11 @@ export default function DashboardPage() {
       const runId = uploadData.run_id;
       setCurrentRunId(runId);
       setFiles([]);
-      toast.success(`${uploadData.total_files} PDF(s) uploaded`);
+      if (uploadData.rejected_count) {
+        toast.warning(`${uploadData.total_files} PDF(s) uploaded. ${uploadData.rejected_count} rejected (limit: ${uploadData.max_pdfs}).`);
+      } else {
+        toast.success(`${uploadData.total_files} PDF(s) uploaded`);
+      }
 
       setIsUploading(false);
       setIsProcessing(true);

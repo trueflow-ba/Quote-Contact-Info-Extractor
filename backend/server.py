@@ -144,10 +144,17 @@ class LoginInput(BaseModel):
     password: str
 
 class SettingsInput(BaseModel):
+    exclusion_domain: Optional[str] = None
+
+class AdminSettingsInput(BaseModel):
     ai_model: Optional[str] = None
     claude_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
-    exclusion_domain: Optional[str] = None
+    max_pdfs_per_upload: Optional[int] = None
+
+class ChangePasswordInput(BaseModel):
+    current_password: str
+    new_password: str
 
 # =============================================================================
 # AUTH ROUTES
@@ -211,7 +218,7 @@ async def login(input: LoginInput, request: Request, response: Response):
     refresh_token = create_refresh_token(user_id)
     response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=900, path="/")
     response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
-    return {"_id": user_id, "email": email, "name": user.get("name", ""), "role": user.get("role", "user")}
+    return {"_id": user_id, "email": email, "name": user.get("name", ""), "role": user.get("role", "user"), "must_change_password": user.get("must_change_password", False)}
 
 @api_router.post("/auth/logout")
 async def logout(response: Response):
@@ -245,40 +252,89 @@ async def refresh(request: Request, response: Response):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 # =============================================================================
-# SETTINGS ROUTES
+# AUTH - CHANGE PASSWORD
+# =============================================================================
+@api_router.post("/auth/change-password")
+async def change_password(input: ChangePasswordInput, request: Request):
+    user_full = await get_current_user(request)
+    user_doc = await db.users.find_one({"_id": ObjectId(user_full["_id"])})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not verify_password(input.current_password, user_doc["password_hash"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(input.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+    await db.users.update_one(
+        {"_id": ObjectId(user_full["_id"])},
+        {"$set": {"password_hash": hash_password(input.new_password), "must_change_password": False}}
+    )
+    return {"message": "Password changed successfully"}
+
+# =============================================================================
+# USER SETTINGS (exclusion domain only - available to all users)
 # =============================================================================
 @api_router.get("/settings")
 async def get_settings(request: Request):
     user = await get_current_user(request)
     settings = await db.settings.find_one({"user_id": user["_id"]}, {"_id": 0})
     if not settings:
-        settings = {"user_id": user["_id"], "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "exclusion_domain": "horizonc.com"}
-    if settings.get("claude_api_key"):
-        settings["claude_api_key_set"] = True
-        settings["claude_api_key"] = ""
-    else:
-        settings["claude_api_key_set"] = False
-    if settings.get("openai_api_key"):
-        settings["openai_api_key_set"] = True
-        settings["openai_api_key"] = ""
-    else:
-        settings["openai_api_key_set"] = False
+        settings = {"user_id": user["_id"], "exclusion_domain": "horizonc.com"}
+    # Also fetch admin config so user knows the model and limits
+    admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    settings["ai_model"] = admin_config.get("ai_model", "claude-sonnet") if admin_config else "claude-sonnet"
+    settings["max_pdfs_per_upload"] = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
     return settings
 
 @api_router.put("/settings")
 async def update_settings(input: SettingsInput, request: Request):
     user = await get_current_user(request)
     update = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    if input.exclusion_domain is not None:
+        update["exclusion_domain"] = input.exclusion_domain
+    await db.settings.update_one({"user_id": user["_id"]}, {"$set": update}, upsert=True)
+    return {"message": "Settings updated"}
+
+# =============================================================================
+# ADMIN SETTINGS (AI model, API keys, PDF limits - admin only)
+# =============================================================================
+async def require_admin(request: Request) -> dict:
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+@api_router.get("/admin/settings")
+async def get_admin_settings(request: Request):
+    await require_admin(request)
+    config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    if not config:
+        config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 50}
+    if config.get("claude_api_key"):
+        config["claude_api_key_set"] = True
+        config["claude_api_key"] = ""
+    else:
+        config["claude_api_key_set"] = False
+    if config.get("openai_api_key"):
+        config["openai_api_key_set"] = True
+        config["openai_api_key"] = ""
+    else:
+        config["openai_api_key_set"] = False
+    return config
+
+@api_router.put("/admin/settings")
+async def update_admin_settings(input: AdminSettingsInput, request: Request):
+    await require_admin(request)
+    update = {"key": "global", "updated_at": datetime.now(timezone.utc).isoformat()}
     if input.ai_model is not None:
         update["ai_model"] = input.ai_model
     if input.claude_api_key is not None:
         update["claude_api_key"] = input.claude_api_key
     if input.openai_api_key is not None:
         update["openai_api_key"] = input.openai_api_key
-    if input.exclusion_domain is not None:
-        update["exclusion_domain"] = input.exclusion_domain
-    await db.settings.update_one({"user_id": user["_id"]}, {"$set": update}, upsert=True)
-    return {"message": "Settings updated"}
+    if input.max_pdfs_per_upload is not None:
+        update["max_pdfs_per_upload"] = max(1, min(500, input.max_pdfs_per_upload))
+    await db.admin_config.update_one({"key": "global"}, {"$set": update}, upsert=True)
+    return {"message": "Admin settings updated"}
 
 # =============================================================================
 # MODEL CONFIG
@@ -289,13 +345,13 @@ MODEL_MAP = {
     "gpt-4o": ("openai", "gpt-4o"),
 }
 
-def get_api_key_for_model(ai_model: str, settings: dict) -> str:
+def get_api_key_for_model(ai_model: str, admin_config: dict) -> str:
     if ai_model.startswith("claude"):
-        custom_key = settings.get("claude_api_key", "")
+        custom_key = admin_config.get("claude_api_key", "")
         if custom_key:
             return custom_key
     elif ai_model.startswith("gpt"):
-        custom_key = settings.get("openai_api_key", "")
+        custom_key = admin_config.get("openai_api_key", "")
         if custom_key:
             return custom_key
     return os.environ.get("EMERGENT_LLM_KEY", "")
@@ -309,6 +365,11 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     user_id = user["_id"]
     run_id = str(uuid.uuid4())
     file_records = []
+    rejected_files = []
+
+    # Get max PDF limit from admin config
+    admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
 
     for file in files:
         data = await file.read()
@@ -317,6 +378,9 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for name in zf.namelist():
                         if name.lower().endswith(".pdf") and not name.startswith("__MACOSX"):
+                            if len(file_records) >= max_pdfs:
+                                rejected_files.append(name.split("/")[-1])
+                                continue
                             pdf_data = zf.read(name)
                             storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
                             put_object(storage_path, pdf_data, "application/pdf")
@@ -334,6 +398,9 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         elif file.filename.lower().endswith(".pdf"):
+            if len(file_records) >= max_pdfs:
+                rejected_files.append(file.filename)
+                continue
             storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
             put_object(storage_path, data, "application/pdf")
             file_records.append({
@@ -368,11 +435,17 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
         "completed_at": None
     }
     await db.runs.insert_one(run_doc)
-    return {
+    result = {
         "run_id": run_id,
         "files": [{"id": f["id"], "filename": f["original_filename"], "size": f["size"]} for f in file_records],
-        "total_files": len(file_records)
+        "total_files": len(file_records),
+        "max_pdfs": max_pdfs,
     }
+    if rejected_files:
+        result["rejected_count"] = len(rejected_files)
+        result["rejected_files"] = rejected_files[:10]
+        result["message"] = f"Upload limit is {max_pdfs} PDFs. {len(rejected_files)} file(s) were rejected."
+    return result
 
 # =============================================================================
 # EXTRACTION ENGINE — Multi-OCR with fallback + PDF compression
@@ -587,9 +660,13 @@ async def process_run(run_id: str, user_id: str):
     try:
         settings = await db.settings.find_one({"user_id": user_id}, {"_id": 0})
         if not settings:
-            settings = {"ai_model": "claude-sonnet", "exclusion_domain": "horizonc.com"}
-        ai_model = settings.get("ai_model", "claude-sonnet")
-        api_key = get_api_key_for_model(ai_model, settings)
+            settings = {"exclusion_domain": "horizonc.com"}
+        # Read AI config from admin settings
+        admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+        if not admin_config:
+            admin_config = {"ai_model": "claude-sonnet"}
+        ai_model = admin_config.get("ai_model", "claude-sonnet")
+        api_key = get_api_key_for_model(ai_model, admin_config)
         exclusion_domain = settings.get("exclusion_domain", "horizonc.com").lower().strip()
         files = await db.files.find({"run_id": run_id, "is_deleted": False}, {"_id": 0}).to_list(1000)
         total_files = len(files)
@@ -923,18 +1000,30 @@ async def startup():
         result = await db.users.insert_one({
             "email": admin_email, "password_hash": hashed,
             "name": "Admin", "role": "admin",
+            "must_change_password": True,
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         user_id = str(result.inserted_id)
         await db.settings.insert_one({
-            "user_id": user_id, "ai_model": "claude-sonnet",
-            "claude_api_key": "", "openai_api_key": "",
+            "user_id": user_id,
             "exclusion_domain": "horizonc.com",
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"Admin user created: {admin_email}")
     elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
+        await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password), "must_change_password": True}})
+    # Seed admin config if not exists
+    admin_config = await db.admin_config.find_one({"key": "global"})
+    if not admin_config:
+        await db.admin_config.insert_one({
+            "key": "global",
+            "ai_model": "claude-sonnet",
+            "claude_api_key": "",
+            "openai_api_key": "",
+            "max_pdfs_per_upload": 50,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info("Admin config seeded")
     # Write test credentials
     os.makedirs("/app/memory", exist_ok=True)
     with open("/app/memory/test_credentials.md", "w") as f:
