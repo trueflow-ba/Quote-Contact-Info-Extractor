@@ -1,11 +1,11 @@
 import { useState, useMemo } from 'react';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
-import { ArrowUpDown, Search, Download } from 'lucide-react';
+import { ArrowUpDown, Search, Download, Layers, List } from 'lucide-react';
 import api from '@/lib/api';
 import { toast } from 'sonner';
 
-const columns = [
+const flatColumns = [
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'company', label: 'Company' },
@@ -17,10 +17,23 @@ const columns = [
   { key: 'source_filename', label: 'Source' },
 ];
 
+const groupedColumns = [
+  { key: 'company', label: 'Company' },
+  { key: 'bid_by', label: 'Bid By' },
+  { key: 'count', label: 'Count' },
+  { key: 'first_name', label: 'First Name' },
+  { key: 'last_name', label: 'Last Name' },
+  { key: 'email', label: 'Email' },
+  { key: 'phone', label: 'Phone' },
+  { key: 'city', label: 'City' },
+  { key: 'state', label: 'State' },
+];
+
 export default function ContactsTable({ contacts, runId }) {
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState('');
   const [sortDir, setSortDir] = useState('asc');
+  const [grouped, setGrouped] = useState(false);
 
   const handleSort = (key) => {
     if (sortKey === key) {
@@ -39,7 +52,7 @@ export default function ContactsTable({ contacts, runId }) {
         Object.values(c).some(v => typeof v === 'string' && v.toLowerCase().includes(q))
       );
     }
-    if (sortKey) {
+    if (sortKey && sortKey !== 'count') {
       data = [...data].sort((a, b) => {
         const av = (a[sortKey] || '').toLowerCase();
         const bv = (b[sortKey] || '').toLowerCase();
@@ -48,6 +61,37 @@ export default function ContactsTable({ contacts, runId }) {
     }
     return data;
   }, [contacts, search, sortKey, sortDir]);
+
+  const groupedData = useMemo(() => {
+    if (!grouped) return null;
+    const groups = {};
+    for (const c of filtered) {
+      const company = (c.company || '').trim().toLowerCase();
+      const bidBy = (c.bid_by || '').trim().toLowerCase();
+      const key = `${company}|||${bidBy}`;
+      if (!groups[key]) {
+        groups[key] = { ...c, count: 1 };
+      } else {
+        groups[key].count += 1;
+      }
+    }
+    let rows = Object.values(groups);
+    if (sortKey === 'count') {
+      rows.sort((a, b) => sortDir === 'asc' ? a.count - b.count : b.count - a.count);
+    } else if (sortKey) {
+      rows.sort((a, b) => {
+        const av = (a[sortKey] || '').toLowerCase();
+        const bv = (b[sortKey] || '').toLowerCase();
+        return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
+    } else {
+      rows.sort((a, b) => b.count - a.count);
+    }
+    return rows;
+  }, [filtered, grouped, sortKey, sortDir]);
+
+  const displayData = grouped ? groupedData : filtered;
+  const activeColumns = grouped ? groupedColumns : flatColumns;
 
   const downloadCSV = async () => {
     if (!runId) return;
@@ -79,18 +123,38 @@ export default function ContactsTable({ contacts, runId }) {
   return (
     <div data-testid="contacts-table-container">
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
-        <div className="relative w-full sm:w-72">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
-          <Input
-            data-testid="contacts-search"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            placeholder="Filter contacts..."
-            className="pl-9 bg-[#111827] border-slate-800 text-slate-300 placeholder:text-slate-600 h-8 text-sm"
-          />
+        <div className="flex items-center gap-3">
+          <div className="relative w-full sm:w-72">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+            <Input
+              data-testid="contacts-search"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Filter contacts..."
+              className="pl-9 bg-[#111827] border-slate-800 text-slate-300 placeholder:text-slate-600 h-8 text-sm"
+            />
+          </div>
+          {/* Group toggle */}
+          <button
+            onClick={() => { setGrouped(g => !g); setSortKey(''); }}
+            className={`rounded-sm px-3 py-1.5 text-sm font-medium transition-all inline-flex items-center gap-2 border ${
+              grouped
+                ? 'bg-purple-500/15 border-purple-500/30 text-purple-300'
+                : 'bg-transparent border-slate-700 text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+            }`}
+            data-testid="group-by-company-button"
+          >
+            {grouped ? <List className="h-3.5 w-3.5" /> : <Layers className="h-3.5 w-3.5" />}
+            {grouped ? 'Show All' : 'Group by Company + Bid'}
+          </button>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-xs text-slate-500">{filtered.length} contacts</span>
+          <span className="text-xs text-slate-500">
+            {grouped
+              ? `${displayData?.length || 0} groups from ${filtered.length} contacts`
+              : `${filtered.length} contacts`
+            }
+          </span>
           <button
             onClick={downloadCSV}
             className="bg-sky-500 hover:bg-sky-600 text-white rounded-sm px-4 py-1.5 text-sm font-medium transition-colors inline-flex items-center gap-2"
@@ -106,7 +170,7 @@ export default function ContactsTable({ contacts, runId }) {
           <Table>
             <TableHeader>
               <TableRow className="border-slate-800 hover:bg-transparent">
-                {columns.map(col => (
+                {activeColumns.map(col => (
                   <TableHead
                     key={col.key}
                     onClick={() => handleSort(col.key)}
@@ -121,14 +185,20 @@ export default function ContactsTable({ contacts, runId }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((c, i) => (
+              {displayData?.map((c, i) => (
                 <TableRow key={c.id || i} className="border-slate-800 hover:bg-slate-800/30 text-sm text-slate-300">
-                  {columns.map(col => (
+                  {activeColumns.map(col => (
                     <TableCell key={col.key} className="py-2 px-3 whitespace-nowrap">
-                      {col.key === 'email' ? (
-                        <span className="font-mono text-xs">{c[col.key]}</span>
-                      ) : col.key === 'phone' ? (
-                        <span className="font-mono text-xs">{c[col.key]}</span>
+                      {col.key === 'count' ? (
+                        <span className={`inline-flex items-center justify-center min-w-[28px] rounded-sm px-2 py-0.5 text-xs font-semibold ${
+                          c.count > 1
+                            ? 'bg-purple-500/15 text-purple-300 border border-purple-500/20'
+                            : 'text-slate-500'
+                        }`}>
+                          {c.count}
+                        </span>
+                      ) : col.key === 'email' || col.key === 'phone' ? (
+                        <span className="font-mono text-xs">{c[col.key] || <span className="text-slate-600">-</span>}</span>
                       ) : (
                         c[col.key] || <span className="text-slate-600">-</span>
                       )}
