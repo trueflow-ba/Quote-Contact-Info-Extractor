@@ -610,6 +610,7 @@ async def extract_contacts_with_ai(text: str, ai_model: str, api_key: str):
 Each contact object must have exactly these fields:
 - "city": string
 - "state": string
+- "quote_amount": string (the total quoted/bid dollar amount for this quote, e.g. "$45,000.00". Only include if clearly stated in the document. Use empty string if not found or uncertain.)
 - "bid_by": string (the full name of the person placing the bid)
 - "company": string
 - "last_name": string
@@ -619,6 +620,7 @@ Each contact object must have exactly these fields:
 
 Rules:
 - If a field is not found, use empty string ""
+- For quote_amount, only extract a value if a clear total bid/quote amount is stated. Do not guess or calculate.
 - Include ALL contacts found even if some fields are missing
 - Return ONLY the JSON array, no markdown, no explanation
 - If no contacts found, return: []
@@ -641,6 +643,7 @@ Document text:
             valid.append({
                 "city": str(c.get("city", "")),
                 "state": str(c.get("state", "")),
+                "quote_amount": str(c.get("quote_amount", "")),
                 "bid_by": str(c.get("bid_by", "")),
                 "company": str(c.get("company", "")),
                 "last_name": str(c.get("last_name", "")),
@@ -1079,7 +1082,8 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     for r in runs:
         run_dates[r["id"]] = r.get("created_at", "")
     field_map = {
-        "city": "City", "state": "State", "bid_by": "Bid By", "company": "Company",
+        "city": "City", "state": "State", "quote_amount": "Quote Amount",
+        "bid_by": "Bid By", "company": "Company",
         "last_name": "Last Name", "first_name": "First Name", "email": "Email",
         "phone": "Phone", "source_filename": "Source File", "import_date": "Import Date",
         "run_id": "Run ID",
@@ -1106,9 +1110,9 @@ async def download_contacts_csv(run_id: str, request: Request):
     contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["City", "State", "Bid By", "Company", "Last Name", "First Name", "Email", "Phone", "Source File"])
+    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Company", "Last Name", "First Name", "Email", "Phone", "Source File"])
     for c in contacts:
-        writer.writerow([c.get("city",""), c.get("state",""), c.get("bid_by",""), c.get("company",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
+        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("company",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),

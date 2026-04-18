@@ -9,6 +9,7 @@ const flatColumns = [
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'company', label: 'Company' },
+  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
   { key: 'city', label: 'City' },
@@ -21,6 +22,7 @@ const groupedColumns = [
   { key: 'company', label: 'Company' },
   { key: 'bid_by', label: 'Bid By' },
   { key: 'count', label: 'Count' },
+  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'email', label: 'Email' },
@@ -114,13 +116,13 @@ export default function ContactsTable({ contacts, runId }) {
 
   const downloadGroupedCSV = () => {
     if (!groupedData?.length) return;
-    const headers = ['Company', 'Bid By', 'Count', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State'];
+    const headers = ['Company', 'Bid By', 'Count', 'Quote Amount', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State'];
     const escapeCSV = (val) => {
       const s = String(val ?? '');
       return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const rows = groupedData.map(c =>
-      [c.company, c.bid_by, c.count, c.first_name, c.last_name, c.email, c.phone, c.city, c.state].map(escapeCSV).join(',')
+      [c.company, c.bid_by, c.count, c.quote_amount, c.first_name, c.last_name, c.email, c.phone, c.city, c.state].map(escapeCSV).join(',')
     );
     const csv = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -229,6 +231,8 @@ export default function ContactsTable({ contacts, runId }) {
                         }`}>
                           {c.count}
                         </span>
+                      ) : col.key === 'quote_amount' ? (
+                        c[col.key] ? <span className="font-mono text-xs text-emerald-400">{c[col.key]}</span> : <span className="text-slate-600">-</span>
                       ) : col.key === 'email' || col.key === 'phone' ? (
                         <span className="font-mono text-xs">{c[col.key] || <span className="text-slate-600">-</span>}</span>
                       ) : (

@@ -10,6 +10,7 @@ const ALL_FIELDS = [
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'company', label: 'Company' },
+  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
   { key: 'city', label: 'City' },
@@ -165,6 +166,8 @@ export default function AllContactsTable() {
                         <span className="font-mono text-xs">{c[col.key] || <span className="text-slate-600">-</span>}</span>
                       ) : col.key === 'import_date' ? (
                         <span className="text-xs text-slate-400">{formatDate(c[col.key])}</span>
+                      ) : col.key === 'quote_amount' ? (
+                        c[col.key] ? <span className="font-mono text-xs text-emerald-400">{c[col.key]}</span> : <span className="text-slate-600">-</span>
                       ) : (
                         c[col.key] || <span className="text-slate-600">-</span>
                       )}
