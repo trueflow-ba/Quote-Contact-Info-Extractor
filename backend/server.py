@@ -88,6 +88,18 @@ def get_object(path: str) -> bytes:
     resp.raise_for_status()
     return resp.content
 
+def delete_object(path: str):
+    key = init_storage()
+    if not key:
+        return
+    try:
+        http_requests.delete(
+            f"{STORAGE_URL}/objects/{path}",
+            headers={"X-Storage-Key": key}, timeout=30
+        )
+    except Exception as e:
+        logger.warning(f"Failed to delete storage object {path}: {e}")
+
 # =============================================================================
 # AUTH HELPERS
 # =============================================================================
@@ -151,6 +163,8 @@ class AdminSettingsInput(BaseModel):
     claude_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
     max_pdfs_per_upload: Optional[int] = None
+    storage_max_mb: Optional[int] = None
+    storage_target_mb: Optional[int] = None
 
 class ChangePasswordInput(BaseModel):
     current_password: str
@@ -308,7 +322,7 @@ async def get_admin_settings(request: Request):
     await require_admin(request)
     config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
     if not config:
-        config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 50}
+        config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 50, "storage_max_mb": 750, "storage_target_mb": 300}
     if config.get("claude_api_key"):
         config["claude_api_key_set"] = True
         config["claude_api_key"] = ""
@@ -333,8 +347,90 @@ async def update_admin_settings(input: AdminSettingsInput, request: Request):
         update["openai_api_key"] = input.openai_api_key
     if input.max_pdfs_per_upload is not None:
         update["max_pdfs_per_upload"] = max(1, min(500, input.max_pdfs_per_upload))
+    if input.storage_max_mb is not None:
+        update["storage_max_mb"] = max(100, min(10000, input.storage_max_mb))
+    if input.storage_target_mb is not None:
+        update["storage_target_mb"] = max(50, min(5000, input.storage_target_mb))
     await db.admin_config.update_one({"key": "global"}, {"$set": update}, upsert=True)
     return {"message": "Admin settings updated"}
+
+# =============================================================================
+# STORAGE MANAGEMENT
+# =============================================================================
+@api_router.get("/admin/storage")
+async def get_storage_usage(request: Request):
+    await require_admin(request)
+    pipeline = [
+        {"$match": {"is_deleted": False}},
+        {"$group": {"_id": None, "total_size": {"$sum": "$size"}, "file_count": {"$sum": 1}}}
+    ]
+    result = await db.files.aggregate(pipeline).to_list(1)
+    total_bytes = result[0]["total_size"] if result else 0
+    file_count = result[0]["file_count"] if result else 0
+    config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    max_mb = config.get("storage_max_mb", 750) if config else 750
+    target_mb = config.get("storage_target_mb", 300) if config else 300
+    return {
+        "total_bytes": total_bytes,
+        "total_mb": round(total_bytes / (1024 * 1024), 1),
+        "file_count": file_count,
+        "max_mb": max_mb,
+        "target_mb": target_mb,
+        "over_limit": total_bytes > max_mb * 1024 * 1024,
+    }
+
+@api_router.post("/admin/storage/cleanup")
+async def trigger_storage_cleanup(request: Request):
+    await require_admin(request)
+    result = await run_storage_cleanup()
+    return result
+
+async def run_storage_cleanup(force=False):
+    """Delete oldest uploaded PDFs when storage exceeds max_mb, down to target_mb.
+       Output data (contacts, errors, etc.) is never touched."""
+    config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    max_mb = config.get("storage_max_mb", 750) if config else 750
+    target_mb = config.get("storage_target_mb", 300) if config else 300
+    max_bytes = max_mb * 1024 * 1024
+    target_bytes = target_mb * 1024 * 1024
+
+    # Get current total
+    pipeline = [
+        {"$match": {"is_deleted": False}},
+        {"$group": {"_id": None, "total_size": {"$sum": "$size"}}}
+    ]
+    result = await db.files.aggregate(pipeline).to_list(1)
+    current_bytes = result[0]["total_size"] if result else 0
+
+    if current_bytes <= max_bytes and not force:
+        return {"message": "Storage within limits", "current_mb": round(current_bytes / (1024 * 1024), 1), "deleted_count": 0}
+
+    # Get files sorted oldest first
+    files = await db.files.find(
+        {"is_deleted": False},
+        {"_id": 0, "id": 1, "storage_path": 1, "size": 1, "created_at": 1}
+    ).sort("created_at", 1).to_list(10000)
+
+    deleted_count = 0
+    freed_bytes = 0
+    for f in files:
+        if current_bytes - freed_bytes <= target_bytes:
+            break
+        # Delete from object storage
+        delete_object(f["storage_path"])
+        # Mark as deleted in DB
+        await db.files.update_one({"id": f["id"]}, {"$set": {"is_deleted": True}})
+        freed_bytes += f.get("size", 0)
+        deleted_count += 1
+
+    remaining = current_bytes - freed_bytes
+    logger.info(f"Storage cleanup: deleted {deleted_count} files, freed {freed_bytes / (1024*1024):.1f}MB, remaining {remaining / (1024*1024):.1f}MB")
+    return {
+        "message": f"Deleted {deleted_count} oldest files",
+        "deleted_count": deleted_count,
+        "freed_mb": round(freed_bytes / (1024 * 1024), 1),
+        "remaining_mb": round(remaining / (1024 * 1024), 1),
+    }
 
 # =============================================================================
 # MODEL CONFIG
@@ -445,6 +541,8 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
         result["rejected_count"] = len(rejected_files)
         result["rejected_files"] = rejected_files[:10]
         result["message"] = f"Upload limit is {max_pdfs} PDFs. {len(rejected_files)} file(s) were rejected."
+    # Auto-cleanup storage if over limit
+    asyncio.create_task(run_storage_cleanup())
     return result
 
 # =============================================================================
@@ -726,7 +824,7 @@ async def process_run(run_id: str, user_id: str):
                 errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
                 return contacts_out, errors_out, True
 
-        CONCURRENT = 3
+        CONCURRENT = 6
         stopped = False
         for i in range(0, len(pending_files), CONCURRENT):
             # --- Check for pause/cancel BEFORE each sub-batch ---
@@ -1222,6 +1320,8 @@ async def startup():
             "claude_api_key": "",
             "openai_api_key": "",
             "max_pdfs_per_upload": 50,
+            "storage_max_mb": 750,
+            "storage_target_mb": 300,
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         logger.info("Admin config seeded")
