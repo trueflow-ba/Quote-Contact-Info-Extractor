@@ -708,18 +708,21 @@ async def extract_contacts_with_ai(text: str, ai_model: str, api_key: str):
 Each contact object must have exactly these fields:
 - "city": string
 - "state": string
-- "quote_amount": string (the total quoted/bid dollar amount for this quote, e.g. "$45,000.00". Only include if clearly stated in the document. Use empty string if not found or uncertain.)
+- "quote_amount": string (the total quoted/bid dollar amount, e.g. "$45,000.00". Only include if clearly stated. Use "" if not found.)
 - "bid_by": string (the full name of the person placing the bid)
-- "company": string
+- "contractor": string (the main/general contractor company — typically in the document header, letterhead, or "Attention"/"To" line. This is who RECEIVES the quote.)
+- "sub_contractor": string (the sub-contractor or vendor company — typically in "Bill To", "From", "Vendor", or body. This is who SENDS the quote/bid.)
 - "last_name": string
 - "first_name": string
 - "email": string
 - "phone": string
 
-Rules:
+Contractor vs Sub-Contractor rules:
+- CONTRACTOR = the general contractor RECEIVING the quote. Usually in header/letterhead/"Attention" line.
+- SUB-CONTRACTOR = the company SENDING the quote/bid, providing services or materials.
+- "Ship To" or "Project" sections indicate job sites, not contacts to extract.
+- If only one company appears, use context to determine which role it fills.
 - If a field is not found, use empty string ""
-- For quote_amount, only extract a value if a clear total bid/quote amount is stated. Do not guess or calculate.
-- Include ALL contacts found even if some fields are missing
 - Return ONLY the JSON array, no markdown, no explanation
 - If no contacts found, return: []
 
@@ -743,7 +746,8 @@ Document text:
                 "state": str(c.get("state", "")),
                 "quote_amount": str(c.get("quote_amount", "")),
                 "bid_by": str(c.get("bid_by", "")),
-                "company": str(c.get("company", "")),
+                "contractor": str(c.get("contractor", "")),
+                "sub_contractor": str(c.get("sub_contractor", "")),
                 "last_name": str(c.get("last_name", "")),
                 "first_name": str(c.get("first_name", "")),
                 "email": str(c.get("email", "")),
@@ -789,21 +793,23 @@ async def extract_contacts_with_ai_vision(pdf_bytes: bytes, filename: str, ai_mo
 Return a JSON array of contact objects. Each object must have exactly these fields:
 - "city": string
 - "state": string
-- "quote_amount": string (the total quoted/bid dollar amount, e.g. "$45,000.00". Only include if clearly visible. Use "" if not found.)
+- "quote_amount": string (the total quoted/bid dollar amount, e.g. "$45,000.00". Only if clearly visible. Use "" if not found.)
 - "bid_by": string (the full name of the person placing the bid)
-- "company": string
+- "contractor": string (the main/general contractor company — usually in the header, letterhead, or "Attention"/"To" line. This is who RECEIVES the quote.)
+- "sub_contractor": string (the sub-contractor or vendor company — usually in "Bill To", "From", "Vendor", or body. This is who SENDS the quote/bid.)
 - "last_name": string
 - "first_name": string
 - "email": string (read carefully - distinguish between 0/O, 1/l/I)
 - "phone": string (read carefully - ensure digits are correct, not confused with letters)
 
-Rules:
-- Read text directly from the images, including typed text, handwritten text, text in headers/footers/letterheads
-- Ignore graphics, logos, and decorative elements
-- If a field is not visible or unreadable, use empty string ""
-- For phone numbers: verify each digit is actually a digit, not a letter (5 vs S, 0 vs O, 1 vs I)
-- For emails: verify the format looks like a valid email address
-- Return ONLY the JSON array, no markdown, no explanation
+Contractor vs Sub-Contractor rules:
+- CONTRACTOR = general contractor RECEIVING the quote (header/letterhead/"Attention")
+- SUB-CONTRACTOR = company SENDING the quote, providing services/materials ("Bill To"/"From"/"Vendor")
+- "Ship To" or "Project" = job site, not a contact
+- Read typed, handwritten, and cursive text from the images
+- Ignore graphics, logos, decorative elements
+- If a field is not visible, use empty string ""
+- Return ONLY the JSON array, no markdown
 - If no contacts found, return: []
 
 Document: {filename}"""
@@ -826,7 +832,8 @@ Document: {filename}"""
                 "state": str(c.get("state", "")),
                 "quote_amount": str(c.get("quote_amount", "")),
                 "bid_by": str(c.get("bid_by", "")),
-                "company": str(c.get("company", "")),
+                "contractor": str(c.get("contractor", "")),
+                "sub_contractor": str(c.get("sub_contractor", "")),
                 "last_name": str(c.get("last_name", "")),
                 "first_name": str(c.get("first_name", "")),
                 "email": str(c.get("email", "")),
@@ -893,7 +900,7 @@ async def process_run(run_id: str, user_id: str):
                     contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
                     if not ai_error and contacts:
                         for contact in contacts:
-                            missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
+                            missing = [f.capitalize() for f in ["email", "phone", "city", "state", "contractor", "sub_contractor"] if not contact.get(f)]
                             if missing and len(missing) >= 4:
                                 errors_out.append({"filename": filename, "reason": "Incomplete extraction - most fields missing", "missing_fields": ", ".join(missing)})
                             contact["source_filename"] = filename
@@ -1045,7 +1052,8 @@ async def process_run(run_id: str, user_id: str):
                     "kept_source": seen_emails[email].get("source_filename", ""),
                     "duplicate_source": c.get("source_filename", ""),
                     "first_name": c.get("first_name", ""), "last_name": c.get("last_name", ""),
-                    "company": c.get("company", ""), "city": c.get("city", ""),
+                    "contractor": c.get("contractor", ""), "sub_contractor": c.get("sub_contractor", ""),
+                    "city": c.get("city", ""),
                     "state": c.get("state", ""), "phone": c.get("phone", ""),
                     "created_at": datetime.now(timezone.utc).isoformat()
                 })
@@ -1078,7 +1086,8 @@ async def process_run(run_id: str, user_id: str):
                     "kept_source": "(previous run)",
                     "duplicate_source": c.get("source_filename", ""),
                     "first_name": c.get("first_name", ""), "last_name": c.get("last_name", ""),
-                    "company": c.get("company", ""), "city": c.get("city", ""),
+                    "contractor": c.get("contractor", ""), "sub_contractor": c.get("sub_contractor", ""),
+                    "city": c.get("city", ""),
                     "state": c.get("state", ""), "phone": c.get("phone", ""),
                     "created_at": datetime.now(timezone.utc).isoformat()
                 })
@@ -1296,7 +1305,7 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
         run_dates[r["id"]] = r.get("created_at", "")
     field_map = {
         "city": "City", "state": "State", "quote_amount": "Quote Amount",
-        "bid_by": "Bid By", "company": "Company",
+        "bid_by": "Bid By", "contractor": "Contractor", "sub_contractor": "Sub-Contractor",
         "last_name": "Last Name", "first_name": "First Name", "email": "Email",
         "phone": "Phone", "source_filename": "Source File", "import_date": "Import Date",
         "run_id": "Run ID",
@@ -1323,9 +1332,9 @@ async def download_contacts_csv(run_id: str, request: Request):
     contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Company", "Last Name", "First Name", "Email", "Phone", "Source File"])
+    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Contractor", "Sub-Contractor", "Last Name", "First Name", "Email", "Phone", "Source File"])
     for c in contacts:
-        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("company",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
+        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("contractor",""), c.get("sub_contractor",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),

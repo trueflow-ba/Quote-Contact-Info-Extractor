@@ -10,7 +10,8 @@ import { toast } from 'sonner';
 const ALL_FIELDS = [
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
-  { key: 'company', label: 'Company' },
+  { key: 'contractor', label: 'Contractor' },
+  { key: 'sub_contractor', label: 'Sub-Contractor' },
   { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
@@ -22,9 +23,10 @@ const ALL_FIELDS = [
 ];
 
 const GROUPED_COLUMNS = [
-  { key: 'company', label: 'Company' },
+  { key: 'sub_contractor', label: 'Sub-Contractor' },
   { key: 'bid_by', label: 'Bid By' },
   { key: 'count', label: 'Count' },
+  { key: 'contractor', label: 'Contractor' },
   { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
@@ -80,7 +82,7 @@ export default function AllContactsTable() {
     if (!grouped) return null;
     const groups = {};
     for (const c of filtered) {
-      const key = `${(c.company || '').trim().toLowerCase()}|||${(c.bid_by || '').trim().toLowerCase()}`;
+      const key = `${(c.sub_contractor || '').trim().toLowerCase()}|||${(c.bid_by || '').trim().toLowerCase()}`;
       if (!groups[key]) groups[key] = { ...c, count: 1 };
       else groups[key].count += 1;
     }
@@ -147,7 +149,7 @@ export default function AllContactsTable() {
             className={`rounded-sm px-3 py-1.5 text-sm font-medium transition-all inline-flex items-center gap-2 border whitespace-nowrap ${grouped ? 'bg-purple-500/15 border-purple-500/30 text-purple-300' : 'bg-transparent border-slate-700 text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
             data-testid="all-group-by-company-button">
             {grouped ? <List className="h-3.5 w-3.5" /> : <Layers className="h-3.5 w-3.5" />}
-            {grouped ? 'Show All' : 'Group by Company + Bid'}
+            {grouped ? 'Show All' : 'Group by Sub + Bid'}
           </button>
           {activeFilterCount > 0 && (
             <button onClick={() => setFilters({})} className="text-xs text-amber-400 hover:text-amber-300 transition-colors whitespace-nowrap" data-testid="clear-all-filters-all">

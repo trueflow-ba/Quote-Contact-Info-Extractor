@@ -42,7 +42,8 @@ export default function DuplicatesTable({ duplicates }) {
               <TableHeader>
                 <TableRow className="border-slate-800 hover:bg-transparent">
                   <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Name</TableHead>
-                  <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Company</TableHead>
+                  <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Contractor</TableHead>
+                  <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Sub-Contractor</TableHead>
                   <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">City / State</TableHead>
                   <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Phone</TableHead>
                   <TableHead className="text-slate-500 font-medium text-xs uppercase tracking-wider py-2 px-3">Duplicate Source</TableHead>
@@ -55,7 +56,8 @@ export default function DuplicatesTable({ duplicates }) {
                     <TableCell className="py-2 px-3 whitespace-nowrap">
                       {d.first_name || d.last_name ? `${d.first_name} ${d.last_name}`.trim() : <span className="text-slate-600">-</span>}
                     </TableCell>
-                    <TableCell className="py-2 px-3">{d.company || <span className="text-slate-600">-</span>}</TableCell>
+                    <TableCell className="py-2 px-3">{d.contractor || <span className="text-slate-600">-</span>}</TableCell>
+                    <TableCell className="py-2 px-3">{d.sub_contractor || <span className="text-slate-600">-</span>}</TableCell>
                     <TableCell className="py-2 px-3 whitespace-nowrap">
                       {d.city || d.state ? `${d.city}${d.city && d.state ? ', ' : ''}${d.state}` : <span className="text-slate-600">-</span>}
                     </TableCell>
