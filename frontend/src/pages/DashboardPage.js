@@ -165,20 +165,40 @@ export default function DashboardPage() {
     try {
       const formData = new FormData();
       files.forEach(f => formData.append('files', f));
-      const { data: uploadData } = await api.post('/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+      const { data: uploadData } = await api.post('/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 300000 // 5 min timeout for the initial POST
+      });
       const runId = uploadData.run_id;
       setCurrentRunId(runId);
       setFiles([]);
       if (uploadData.rejected_count) {
-        toast.warning(`${uploadData.total_files} PDF(s) uploaded. ${uploadData.rejected_count} rejected (limit: ${uploadData.max_pdfs}).`);
+        toast.warning(`${uploadData.total_files} PDF(s) accepted. ${uploadData.rejected_count} rejected (limit: ${uploadData.max_pdfs}).`);
       } else {
-        toast.success(`${uploadData.total_files} PDF(s) uploaded`);
+        toast.success(`${uploadData.total_files} PDF(s) — uploading to storage...`);
       }
       setIsUploading(false);
       setIsProcessing(true);
-      setProgress({ status: 'processing', percentage: 0, message: 'Starting extraction...' });
-      await api.post(`/extract/${runId}`);
-      startPolling(runId);
+      setProgress({ status: 'uploading', percentage: 0, message: 'Uploading PDFs to storage...' });
+
+      // Poll until upload finishes, then auto-start extraction
+      const uploadPoll = setInterval(async () => {
+        try {
+          const { data: prog } = await api.get(`/progress/${runId}`);
+          setProgress(prog);
+          if (prog.status === 'uploaded') {
+            clearInterval(uploadPoll);
+            // Auto-start extraction
+            setProgress({ status: 'processing', percentage: 50, message: 'Starting extraction...' });
+            await api.post(`/extract/${runId}`);
+            startPolling(runId);
+          } else if (prog.status === 'failed') {
+            clearInterval(uploadPoll);
+            setIsProcessing(false);
+            toast.error('Upload to storage failed: ' + (prog.message || ''));
+          }
+        } catch {}
+      }, 2000);
     } catch (err) {
       toast.error(err.response?.data?.detail || 'Upload failed');
       setIsUploading(false);
@@ -218,7 +238,7 @@ export default function DashboardPage() {
           <UploadZone files={files} setFiles={setFiles} />
 
           {/* Progress bar + controls */}
-          {progress && ['processing', 'paused', 'pausing', 'cancelling'].includes(progress.status) && (
+          {progress && ['uploading', 'processing', 'paused', 'pausing', 'cancelling'].includes(progress.status) && (
             <div className="bg-[#111827] border border-slate-800 rounded-sm p-4" data-testid="progress-container">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm text-slate-300">{progress.message || 'Processing...'}</span>
@@ -226,8 +246,8 @@ export default function DashboardPage() {
               </div>
               <div className="bg-slate-800 rounded-full h-1.5 overflow-hidden w-full">
                 <div
-                  className={`h-full transition-all duration-300 ease-out ${progress.status === 'paused' ? 'bg-sky-400' : 'bg-amber-500'}`}
-                  style={{ width: `${progress.percentage || 0}%`, boxShadow: progress.status === 'paused' ? '0 0 8px rgba(14,165,233,0.5)' : '0 0 8px rgba(245,158,11,0.5)' }}
+                  className={`h-full transition-all duration-300 ease-out ${progress.status === 'paused' ? 'bg-sky-400' : progress.status === 'uploading' ? 'bg-sky-500' : 'bg-amber-500'}`}
+                  style={{ width: `${progress.percentage || 0}%`, boxShadow: progress.status === 'paused' ? '0 0 8px rgba(14,165,233,0.5)' : progress.status === 'uploading' ? '0 0 8px rgba(14,165,233,0.3)' : '0 0 8px rgba(245,158,11,0.5)' }}
                 />
               </div>
               {progress.current_file && progress.status === 'processing' && (

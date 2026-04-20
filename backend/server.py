@@ -460,12 +460,14 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     user = await get_current_user(request)
     user_id = user["_id"]
     run_id = str(uuid.uuid4())
-    file_records = []
-    rejected_files = []
 
     # Get max PDF limit from admin config
     admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
     max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
+
+    # Phase 1: Quick — read files into memory, count PDFs, create run record immediately
+    pdf_buffers = []  # list of (filename, bytes)
+    rejected_files = []
 
     for file in files:
         data = await file.read()
@@ -474,75 +476,92 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for name in zf.namelist():
                         if name.lower().endswith(".pdf") and not name.startswith("__MACOSX"):
-                            if len(file_records) >= max_pdfs:
+                            if len(pdf_buffers) >= max_pdfs:
                                 rejected_files.append(name.split("/")[-1])
                                 continue
-                            pdf_data = zf.read(name)
-                            storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
-                            put_object(storage_path, pdf_data, "application/pdf")
-                            file_records.append({
-                                "id": str(uuid.uuid4()),
-                                "run_id": run_id,
-                                "user_id": user_id,
-                                "storage_path": storage_path,
-                                "original_filename": name.split("/")[-1],
-                                "content_type": "application/pdf",
-                                "size": len(pdf_data),
-                                "is_deleted": False,
-                                "created_at": datetime.now(timezone.utc).isoformat()
-                            })
+                            pdf_buffers.append((name.split("/")[-1], zf.read(name)))
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         elif file.filename.lower().endswith(".pdf"):
-            if len(file_records) >= max_pdfs:
+            if len(pdf_buffers) >= max_pdfs:
                 rejected_files.append(file.filename)
                 continue
-            storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
-            put_object(storage_path, data, "application/pdf")
-            file_records.append({
-                "id": str(uuid.uuid4()),
-                "run_id": run_id,
-                "user_id": user_id,
-                "storage_path": storage_path,
-                "original_filename": file.filename,
-                "content_type": "application/pdf",
-                "size": len(data),
-                "is_deleted": False,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            })
+            pdf_buffers.append((file.filename, data))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Only PDF and ZIP files are accepted.")
 
-    if not file_records:
+    if not pdf_buffers:
         raise HTTPException(status_code=400, detail="No PDF files found in upload")
 
-    await db.files.insert_many(file_records)
+    total_files = len(pdf_buffers)
+
+    # Create run record immediately so frontend gets a fast response
     run_doc = {
-        "id": run_id,
-        "user_id": user_id,
-        "status": "uploaded",
-        "total_files": len(file_records),
+        "id": run_id, "user_id": user_id, "status": "uploading",
+        "total_files": total_files,
         "stats": {
-            "total_pdfs": len(file_records), "processed": 0, "errors": 0,
+            "total_pdfs": total_files, "processed": 0, "errors": 0,
             "contacts_extracted": 0, "duplicates_removed": 0,
             "excluded_no_contact": 0, "excluded_internal": 0, "net_new": 0
         },
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None
+        "created_at": datetime.now(timezone.utc).isoformat(), "completed_at": None
     }
     await db.runs.insert_one(run_doc)
+    await db.progress.update_one(
+        {"run_id": run_id},
+        {"$set": {"status": "uploading", "total_files": total_files, "processed_files": 0, "percentage": 0, "message": f"Uploading {total_files} PDFs to storage..."}},
+        upsert=True
+    )
+
+    # Phase 2: Background — upload PDFs to object storage
+    async def upload_to_storage():
+        try:
+            file_records = []
+            for idx, (filename, pdf_data) in enumerate(pdf_buffers):
+                storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
+                put_object(storage_path, pdf_data, "application/pdf")
+                file_records.append({
+                    "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                    "storage_path": storage_path, "original_filename": filename,
+                    "content_type": "application/pdf", "size": len(pdf_data),
+                    "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
+                })
+                if (idx + 1) % 10 == 0 or idx == len(pdf_buffers) - 1:
+                    pct = int((idx + 1) / total_files * 50)  # upload is 0-50%
+                    await db.progress.update_one(
+                        {"run_id": run_id},
+                        {"$set": {"processed_files": idx + 1, "percentage": pct, "message": f"Uploading {idx + 1}/{total_files} to storage..."}}
+                    )
+            if file_records:
+                await db.files.insert_many(file_records)
+            await db.runs.update_one({"id": run_id}, {"$set": {"status": "uploaded"}})
+            await db.progress.update_one(
+                {"run_id": run_id},
+                {"$set": {"status": "uploaded", "percentage": 50, "message": f"Upload complete. {total_files} PDFs ready for extraction."}}
+            )
+            logger.info(f"Upload complete for run {run_id}: {total_files} files stored")
+            # Auto-cleanup old storage
+            await run_storage_cleanup()
+        except Exception as e:
+            logger.error(f"Upload to storage failed for run {run_id}: {e}")
+            await db.runs.update_one({"id": run_id}, {"$set": {"status": "failed"}})
+            await db.progress.update_one(
+                {"run_id": run_id},
+                {"$set": {"status": "failed", "message": f"Upload failed: {str(e)}"}}
+            )
+
+    asyncio.create_task(upload_to_storage())
+
     result = {
         "run_id": run_id,
-        "files": [{"id": f["id"], "filename": f["original_filename"], "size": f["size"]} for f in file_records],
-        "total_files": len(file_records),
+        "files": [{"id": "", "filename": f[0], "size": len(f[1])} for f in pdf_buffers[:20]],
+        "total_files": total_files,
         "max_pdfs": max_pdfs,
     }
     if rejected_files:
         result["rejected_count"] = len(rejected_files)
         result["rejected_files"] = rejected_files[:10]
         result["message"] = f"Upload limit is {max_pdfs} PDFs. {len(rejected_files)} file(s) were rejected."
-    # Auto-cleanup storage if over limit
-    asyncio.create_task(run_storage_cleanup())
     return result
 
 # =============================================================================

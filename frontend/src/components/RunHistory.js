@@ -89,6 +89,7 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                   <div className={`w-2 h-2 rounded-full shrink-0 ${
                     run.status === 'completed' ? 'bg-emerald-400' :
                     run.status === 'processing' ? 'bg-amber-400 animate-pulse' :
+                    run.status === 'uploading' ? 'bg-sky-400 animate-pulse' :
                     run.status === 'paused' ? 'bg-sky-400' :
                     run.status === 'cancelled' ? 'bg-slate-400' :
                     run.status === 'stale' ? 'bg-orange-400' :
