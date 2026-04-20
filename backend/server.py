@@ -27,7 +27,7 @@ import jwt as pyjwt
 import requests as http_requests
 import pdfplumber
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContent
 
 # =============================================================================
 # CONFIG
@@ -757,6 +757,90 @@ Document text:
         logger.error(f"AI extraction failed: {e}")
         return [], str(e)
 
+async def extract_contacts_with_ai_vision(pdf_bytes: bytes, filename: str, ai_model: str, api_key: str):
+    """Send PDF page images directly to AI vision for contact extraction. Bypasses OCR entirely."""
+    import base64
+    from pdf2image import convert_from_bytes
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=200, fmt="jpeg")
+    except Exception as e:
+        logger.error(f"PDF to image failed for vision on {filename}: {e}")
+        return [], f"Could not convert PDF to images: {e}"
+
+    provider, model = MODEL_MAP.get(ai_model, ("anthropic", "claude-4-sonnet-20250514"))
+    chat = LlmChat(
+        api_key=api_key,
+        session_id=f"vision-{uuid.uuid4()}",
+        system_message="You are a data extraction specialist for construction industry documents. You are looking at scanned document images. Extract contact information by reading the images directly. Always return valid JSON."
+    ).with_model(provider, model)
+
+    all_contacts = []
+    # Process up to 5 pages (most contact info is on first/last pages)
+    pages_to_scan = images[:5]
+    file_contents = []
+    for img in pages_to_scan:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        file_contents.append(FileContent(content_type="image/jpeg", file_content_base64=b64))
+
+    prompt = f"""Look at these scanned construction document page images. Extract ALL contact information you can see.
+
+Return a JSON array of contact objects. Each object must have exactly these fields:
+- "city": string
+- "state": string
+- "quote_amount": string (the total quoted/bid dollar amount, e.g. "$45,000.00". Only include if clearly visible. Use "" if not found.)
+- "bid_by": string (the full name of the person placing the bid)
+- "company": string
+- "last_name": string
+- "first_name": string
+- "email": string (read carefully - distinguish between 0/O, 1/l/I)
+- "phone": string (read carefully - ensure digits are correct, not confused with letters)
+
+Rules:
+- Read text directly from the images, including typed text, handwritten text, text in headers/footers/letterheads
+- Ignore graphics, logos, and decorative elements
+- If a field is not visible or unreadable, use empty string ""
+- For phone numbers: verify each digit is actually a digit, not a letter (5 vs S, 0 vs O, 1 vs I)
+- For emails: verify the format looks like a valid email address
+- Return ONLY the JSON array, no markdown, no explanation
+- If no contacts found, return: []
+
+Document: {filename}"""
+
+    try:
+        response = await chat.send_message(UserMessage(text=prompt, file_contents=file_contents))
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        contacts = json.loads(cleaned)
+        if not isinstance(contacts, list):
+            contacts = [contacts] if isinstance(contacts, dict) else []
+        valid = []
+        for c in contacts:
+            if not isinstance(c, dict):
+                continue
+            valid.append({
+                "city": str(c.get("city", "")),
+                "state": str(c.get("state", "")),
+                "quote_amount": str(c.get("quote_amount", "")),
+                "bid_by": str(c.get("bid_by", "")),
+                "company": str(c.get("company", "")),
+                "last_name": str(c.get("last_name", "")),
+                "first_name": str(c.get("first_name", "")),
+                "email": str(c.get("email", "")),
+                "phone": str(c.get("phone", "")),
+            })
+        logger.info(f"AI Vision extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages)")
+        return valid, None
+    except json.JSONDecodeError:
+        logger.error(f"AI Vision returned invalid JSON for {filename}")
+        return [], "AI Vision returned invalid response format"
+    except Exception as e:
+        logger.error(f"AI Vision extraction failed for {filename}: {e}")
+        return [], str(e)
+
 async def process_run(run_id: str, user_id: str):
     """Process PDFs with pause/resume/cancel support. State is persisted in MongoDB."""
     try:
@@ -800,25 +884,45 @@ async def process_run(run_id: str, user_id: str):
                 pdf_bytes = get_object(file_record["storage_path"])
                 if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
                     pdf_bytes = compress_pdf(pdf_bytes, filename)
+
+                # Step 1: Try text extraction (fast path for text-based PDFs)
                 text, text_error = await extract_text_from_pdf(pdf_bytes, filename)
-                if text_error and not text_error.get("partial", False):
-                    errors_out.append({"filename": filename, "reason": text_error["reason"], "missing_fields": text_error.get("missing_fields", "")})
-                    return contacts_out, errors_out, True
-                contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
-                if ai_error and not contacts:
-                    errors_out.append({"filename": filename, "reason": f"AI extraction failed: {ai_error}", "missing_fields": "All fields"})
-                    return contacts_out, errors_out, True
-                if not contacts:
-                    errors_out.append({"filename": filename, "reason": "No contact information found in document", "missing_fields": "All fields"})
-                for contact in contacts:
-                    missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
-                    if missing and len(missing) >= 4:
-                        errors_out.append({"filename": filename, "reason": "Incomplete extraction - most fields missing", "missing_fields": ", ".join(missing)})
-                    contact["source_filename"] = filename
-                    contacts_out.append(contact)
-                if text_error and text_error.get("partial"):
-                    errors_out.append({"filename": filename, "reason": text_error["reason"], "missing_fields": "Possible inaccuracies in all fields"})
-                return contacts_out, errors_out, bool(errors_out and not contacts)
+
+                if text and not text_error:
+                    # Good text layer — use text-based AI extraction
+                    contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
+                    if not ai_error and contacts:
+                        for contact in contacts:
+                            missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
+                            if missing and len(missing) >= 4:
+                                errors_out.append({"filename": filename, "reason": "Incomplete extraction - most fields missing", "missing_fields": ", ".join(missing)})
+                            contact["source_filename"] = filename
+                            contacts_out.append(contact)
+                        return contacts_out, errors_out, bool(errors_out and not contacts_out)
+                    # Text extraction found text but AI couldn't parse — fall through to vision
+
+                # Step 2: AI Vision — send page images directly to the AI
+                # This handles: scanned PDFs, image-heavy layouts, handwritten text,
+                # and any case where text extraction or OCR would struggle
+                logger.info(f"Using AI Vision for {filename} (text extraction {'partial' if text_error else 'failed or no contacts'})")
+                vision_contacts, vision_error = await extract_contacts_with_ai_vision(pdf_bytes, filename, ai_model, api_key)
+
+                if vision_contacts:
+                    for contact in vision_contacts:
+                        missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
+                        if missing and len(missing) >= 4:
+                            errors_out.append({"filename": filename, "reason": "Incomplete extraction via AI Vision - most fields missing", "missing_fields": ", ".join(missing)})
+                        contact["source_filename"] = filename
+                        contacts_out.append(contact)
+                    if text_error and text_error.get("partial"):
+                        errors_out.append({"filename": filename, "reason": f"Used AI Vision (original: {text_error['reason']})", "missing_fields": "Results from AI Vision"})
+                    return contacts_out, errors_out, bool(errors_out and not contacts_out)
+
+                # Step 3: Both failed
+                reason = vision_error or (text_error.get("reason") if text_error else "No contact information found")
+                errors_out.append({"filename": filename, "reason": f"All extraction methods failed: {reason}", "missing_fields": "All fields"})
+                return contacts_out, errors_out, True
+
             except Exception as e:
                 logger.error(f"Error processing {filename}: {e}")
                 errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
