@@ -1473,6 +1473,13 @@ async def delete_all_data(request: Request):
 # =============================================================================
 @app.on_event("startup")
 async def startup():
+    # Ensure poppler is installed (needed for pdf2image)
+    import subprocess
+    try:
+        subprocess.run(["which", "pdftoppm"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        logger.warning("poppler-utils not found, installing...")
+        subprocess.run(["apt-get", "install", "-y", "poppler-utils"], capture_output=True)
     try:
         init_storage()
         logger.info("Object storage initialized")
