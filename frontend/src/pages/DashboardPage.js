@@ -51,13 +51,29 @@ export default function DashboardPage() {
     } catch { return []; }
   }, []);
 
-  // -- Polling: self-contained, uses refs to avoid stale closures --
+  // -- Polling: self-contained, refreshes tables periodically during processing --
+  const pollCountRef = useRef(0);
   const startPolling = useCallback((runId) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    pollCountRef.current = 0;
     pollRef.current = setInterval(async () => {
       try {
         const { data } = await api.get(`/progress/${runId}`);
         setProgress(data);
+        pollCountRef.current += 1;
+
+        // Every 5th poll (~10 sec), refresh the live tables
+        if (data.status === 'processing' && pollCountRef.current % 5 === 0) {
+          try {
+            const [c, e] = await Promise.all([
+              api.get(`/runs/${runId}/contacts`),
+              api.get(`/runs/${runId}/errors`),
+            ]);
+            setContacts(c.data);
+            setErrors(e.data);
+          } catch {}
+        }
+
         if (['completed', 'failed', 'stale', 'paused', 'cancelled'].includes(data.status)) {
           clearInterval(pollRef.current);
           pollRef.current = null;
@@ -66,7 +82,7 @@ export default function DashboardPage() {
           else if (data.status === 'paused') toast.info('Extraction paused');
           else if (data.status === 'cancelled') toast.info('Extraction cancelled');
           else if (data.status === 'failed') toast.error('Processing failed: ' + (data.message || ''));
-          // Refresh all data
+          // Full refresh on completion
           try {
             const [r, c, e, d, ch] = await Promise.all([
               api.get(`/runs/${runId}`), api.get(`/runs/${runId}/contacts`),

@@ -1209,7 +1209,12 @@ async def get_run(run_id: str, request: Request):
 @api_router.get("/runs/{run_id}/contacts")
 async def get_run_contacts(run_id: str, request: Request):
     user = await get_current_user(request)
-    contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
+    # During processing, contacts are in raw_contacts; after completion, in contacts
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0, "status": 1})
+    if run and run.get("status") in ("processing", "paused", "pausing"):
+        contacts = await db.raw_contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
+    else:
+        contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
     return contacts
 
 @api_router.get("/runs/{run_id}/errors")
