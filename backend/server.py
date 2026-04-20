@@ -784,7 +784,7 @@ async def extract_contacts_with_ai_vision(pdf_bytes: bytes, filename: str, ai_mo
     file_contents = []
     for img in pages_to_scan:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=92)
         b64 = base64.b64encode(buf.getvalue()).decode()
         file_contents.append(FileContent(content_type="image/jpeg", file_content_base64=b64))
 
@@ -851,41 +851,47 @@ Document: {filename}"""
 # =============================================================================
 # GEMINI PDF EXTRACTION (direct vision analysis)
 # =============================================================================
-GEMINI_EXTRACTION_PROMPT = """Analyze this construction document. Extract ALL contact information visible.
+GEMINI_EXTRACTION_PROMPT = """You are analyzing a construction bid/quote document. Extract ALL contact information visible.
+
+CRITICAL: This document is a quote or bid from a sub-contractor TO a general contractor. You MUST identify BOTH parties:
+- The CONTRACTOR (general contractor) who is RECEIVING this quote — look carefully in ALL of these locations:
+  * "Attention:", "Attn:", "To:", "Submitted To:", "Customer:", "Proposal For:", "Quoted To:", "Bill To:" fields
+  * Page header or top-right address block
+  * The name/company the quote is addressed to
+  * Sometimes appears as the job owner or project contact
+  * Even if it's just a name and company in small text at the top
+- The SUB-CONTRACTOR (vendor) who is SENDING this quote — typically:
+  * The company whose letterhead/logo appears on the document
+  * "From:", "Submitted By:", "Vendor:", "Prepared By:" fields
+  * The company providing services, materials, or labor
 
 Return a JSON array of contact objects. Each object must have exactly these fields:
 - "city": string
-- "state": string
-- "quote_amount": string (total quoted/bid dollar amount like "$45,000.00". Only if clearly stated. Use "" if not found.)
-- "bid_by": string (full name of the person placing the bid)
-- "contractor": string (the main/general contractor company — typically in header, letterhead, or "Attention"/"To" line. This is who RECEIVES the quote.)
-- "sub_contractor": string (the sub-contractor or vendor company — typically in "Bill To", "From", "Vendor", or body. This is who SENDS the quote/bid, providing services or materials.)
-- "last_name": string
-- "first_name": string
+- "state": string  
+- "quote_amount": string (total bid amount like "$45,000.00". Only if clearly stated.)
+- "bid_by": string (full name of person placing/sending the bid)
+- "contractor": string (general contractor company name RECEIVING the quote. LOOK CAREFULLY - it is almost always present somewhere on the document even if in small text.)
+- "sub_contractor": string (sub-contractor/vendor company SENDING the quote)
+- "last_name": string (of the sub-contractor contact)
+- "first_name": string (of the sub-contractor contact)
 - "email": string
 - "phone": string
 
-Contractor vs Sub-Contractor identification:
-- CONTRACTOR = the general contractor RECEIVING the quote. Usually appears in header, letterhead, logo area, or "Attention"/"To" field.
-- SUB-CONTRACTOR = the company SENDING/providing the quote/bid. Usually in "Bill To", "From", "Vendor", "Submitted By", or the company whose letterhead the quote is on.
-- "Ship To" or "Project" sections = job site location, not a company contact.
-- If only one company is listed, use document context (is it a quote FROM them, or TO them?) to assign correctly.
-- If 3 entities appear: header = contractor, bill to = sub-contractor, ship to = customer/job site (ignore ship to).
-
-Additional rules:
-- Read all text carefully including headers, footers, fine print, and letterheads
-- For phone numbers: verify digits are correct (5 not S, 0 not O, 1 not I/l)
-- For emails: must look like a valid email (contains @ and a domain)
-- If a field cannot be determined, use empty string ""
-- Return ONLY the JSON array. No markdown code blocks. No explanation text.
-- If no contacts found, return: []"""
+IMPORTANT RULES:
+- On single-page quotes, the contractor name is often in a small "Attn" or "To" field near the top — read ALL text carefully, including small/fine print
+- If you see "Horizon" or any company name in an address-to field, that is the CONTRACTOR
+- "Ship To" or "Project" or "Job Site" = location, not a company contact
+- Phone: verify digits (5≠S, 0≠O, 1≠I)
+- Email: must contain @ and a domain
+- If a field is not found, use empty string ""
+- Return ONLY the JSON array. No markdown. No explanation."""
 
 async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
     """Use Gemini vision to directly analyze PDF pages and extract contacts."""
     import base64
     from pdf2image import convert_from_bytes
     try:
-        images = convert_from_bytes(pdf_bytes, dpi=200, fmt="jpeg")
+        images = convert_from_bytes(pdf_bytes, dpi=250, fmt="jpeg")
     except Exception as e:
         logger.error(f"PDF to image failed for Gemini on {filename}: {e}")
         return [], f"Could not convert PDF to images: {e}"
@@ -893,7 +899,7 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
     chat = LlmChat(
         api_key=api_key,
         session_id=f"gemini-{uuid.uuid4()}",
-        system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images and extract structured contact information with high accuracy. Always return valid JSON."
+        system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images with extreme attention to detail, reading ALL text on the page including small print, headers, footers, and address fields. You ALWAYS identify both the contractor (receiving party) and sub-contractor (sending party). Always return valid JSON."
     ).with_model("gemini", "gemini-2.5-flash")
 
     # Send up to 8 pages to Gemini (it handles large context well)
@@ -901,7 +907,7 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
     image_contents = []
     for img in pages_to_scan:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=92)
         b64 = base64.b64encode(buf.getvalue()).decode()
         image_contents.append(ImageContent(image_base64=b64))
 
