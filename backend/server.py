@@ -892,6 +892,12 @@ async def process_run(run_id: str, user_id: str):
                      "$set": {"processed_files": processed_count,
                               "percentage": int(processed_count / total_files * 100)}}
                 )
+                # Delete processed PDFs from storage immediately — output data stays in DB
+                for idx2, fid in enumerate(new_file_ids):
+                    fr = sub[idx2] if idx2 < len(sub) else None
+                    if fr and fr.get("storage_path"):
+                        delete_object(fr["storage_path"])
+                        await db.files.update_one({"id": fid}, {"$set": {"is_deleted": True}})
 
         if stopped:
             return
