@@ -27,7 +27,7 @@ import jwt as pyjwt
 import requests as http_requests
 import pdfplumber
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContent
+from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContent, ImageContent
 
 # =============================================================================
 # CONFIG
@@ -848,6 +848,99 @@ Document: {filename}"""
         logger.error(f"AI Vision extraction failed for {filename}: {e}")
         return [], str(e)
 
+# =============================================================================
+# GEMINI PDF EXTRACTION (direct vision analysis)
+# =============================================================================
+GEMINI_EXTRACTION_PROMPT = """Analyze this construction document. Extract ALL contact information visible.
+
+Return a JSON array of contact objects. Each object must have exactly these fields:
+- "city": string
+- "state": string
+- "quote_amount": string (total quoted/bid dollar amount like "$45,000.00". Only if clearly stated. Use "" if not found.)
+- "bid_by": string (full name of the person placing the bid)
+- "contractor": string (the main/general contractor company — typically in header, letterhead, or "Attention"/"To" line. This is who RECEIVES the quote.)
+- "sub_contractor": string (the sub-contractor or vendor company — typically in "Bill To", "From", "Vendor", or body. This is who SENDS the quote/bid, providing services or materials.)
+- "last_name": string
+- "first_name": string
+- "email": string
+- "phone": string
+
+Contractor vs Sub-Contractor identification:
+- CONTRACTOR = the general contractor RECEIVING the quote. Usually appears in header, letterhead, logo area, or "Attention"/"To" field.
+- SUB-CONTRACTOR = the company SENDING/providing the quote/bid. Usually in "Bill To", "From", "Vendor", "Submitted By", or the company whose letterhead the quote is on.
+- "Ship To" or "Project" sections = job site location, not a company contact.
+- If only one company is listed, use document context (is it a quote FROM them, or TO them?) to assign correctly.
+- If 3 entities appear: header = contractor, bill to = sub-contractor, ship to = customer/job site (ignore ship to).
+
+Additional rules:
+- Read all text carefully including headers, footers, fine print, and letterheads
+- For phone numbers: verify digits are correct (5 not S, 0 not O, 1 not I/l)
+- For emails: must look like a valid email (contains @ and a domain)
+- If a field cannot be determined, use empty string ""
+- Return ONLY the JSON array. No markdown code blocks. No explanation text.
+- If no contacts found, return: []"""
+
+async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
+    """Use Gemini vision to directly analyze PDF pages and extract contacts."""
+    import base64
+    from pdf2image import convert_from_bytes
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=200, fmt="jpeg")
+    except Exception as e:
+        logger.error(f"PDF to image failed for Gemini on {filename}: {e}")
+        return [], f"Could not convert PDF to images: {e}"
+
+    chat = LlmChat(
+        api_key=api_key,
+        session_id=f"gemini-{uuid.uuid4()}",
+        system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images and extract structured contact information with high accuracy. Always return valid JSON."
+    ).with_model("gemini", "gemini-2.5-flash")
+
+    # Send up to 8 pages to Gemini (it handles large context well)
+    pages_to_scan = images[:8]
+    image_contents = []
+    for img in pages_to_scan:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        image_contents.append(ImageContent(image_base64=b64))
+
+    prompt = f"{GEMINI_EXTRACTION_PROMPT}\n\nDocument filename: {filename}"
+
+    try:
+        response = await chat.send_message(UserMessage(text=prompt, file_contents=image_contents))
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        contacts = json.loads(cleaned)
+        if not isinstance(contacts, list):
+            contacts = [contacts] if isinstance(contacts, dict) else []
+        valid = []
+        for c in contacts:
+            if not isinstance(c, dict):
+                continue
+            valid.append({
+                "city": str(c.get("city", "")),
+                "state": str(c.get("state", "")),
+                "quote_amount": str(c.get("quote_amount", "")),
+                "bid_by": str(c.get("bid_by", "")),
+                "contractor": str(c.get("contractor", "")),
+                "sub_contractor": str(c.get("sub_contractor", "")),
+                "last_name": str(c.get("last_name", "")),
+                "first_name": str(c.get("first_name", "")),
+                "email": str(c.get("email", "")),
+                "phone": str(c.get("phone", "")),
+            })
+        logger.info(f"Gemini extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages)")
+        return valid, None
+    except json.JSONDecodeError as e:
+        logger.error(f"Gemini returned invalid JSON for {filename}: {e}")
+        return [], "Gemini returned invalid response format"
+    except Exception as e:
+        logger.error(f"Gemini extraction failed for {filename}: {e}")
+        return [], str(e)
+
 async def process_run(run_id: str, user_id: str):
     """Process PDFs with pause/resume/cancel support. State is persisted in MongoDB."""
     try:
@@ -885,6 +978,7 @@ async def process_run(run_id: str, user_id: str):
         )
 
         async def process_single_file(file_record):
+            """Process a single PDF using Gemini vision directly."""
             filename = file_record["original_filename"]
             contacts_out, errors_out = [], []
             try:
@@ -892,48 +986,33 @@ async def process_run(run_id: str, user_id: str):
                 if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
                     pdf_bytes = compress_pdf(pdf_bytes, filename)
 
-                # Step 1: Try text extraction (fast path for text-based PDFs)
-                text, text_error = await extract_text_from_pdf(pdf_bytes, filename)
+                # Pure Gemini vision extraction — send PDF pages as images
+                gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
+                contacts, gemini_error = await extract_contacts_with_gemini(pdf_bytes, filename, gemini_key)
 
-                if text and not text_error:
-                    # Good text layer — use text-based AI extraction
-                    contacts, ai_error = await extract_contacts_with_ai(text, ai_model, api_key)
-                    if not ai_error and contacts:
-                        for contact in contacts:
-                            missing = [f.capitalize() for f in ["email", "phone", "city", "state", "contractor", "sub_contractor"] if not contact.get(f)]
-                            if missing and len(missing) >= 4:
-                                errors_out.append({"filename": filename, "reason": "Incomplete extraction - most fields missing", "missing_fields": ", ".join(missing)})
-                            contact["source_filename"] = filename
-                            contacts_out.append(contact)
-                        return contacts_out, errors_out, bool(errors_out and not contacts_out)
-                    # Text extraction found text but AI couldn't parse — fall through to vision
+                if gemini_error and not contacts:
+                    errors_out.append({"filename": filename, "reason": f"Gemini extraction failed: {gemini_error}", "missing_fields": "All fields"})
+                    return contacts_out, errors_out, True
 
-                # Step 2: AI Vision — send page images directly to the AI
-                # This handles: scanned PDFs, image-heavy layouts, handwritten text,
-                # and any case where text extraction or OCR would struggle
-                logger.info(f"Using AI Vision for {filename} (text extraction {'partial' if text_error else 'failed or no contacts'})")
-                vision_contacts, vision_error = await extract_contacts_with_ai_vision(pdf_bytes, filename, ai_model, api_key)
+                if not contacts:
+                    errors_out.append({"filename": filename, "reason": "No contact information found by Gemini", "missing_fields": "All fields"})
 
-                if vision_contacts:
-                    for contact in vision_contacts:
-                        missing = [f.capitalize() for f in ["email", "phone", "city", "state", "company"] if not contact.get(f)]
-                        if missing and len(missing) >= 4:
-                            errors_out.append({"filename": filename, "reason": "Incomplete extraction via AI Vision - most fields missing", "missing_fields": ", ".join(missing)})
-                        contact["source_filename"] = filename
-                        contacts_out.append(contact)
-                    if text_error and text_error.get("partial"):
-                        errors_out.append({"filename": filename, "reason": f"Used AI Vision (original: {text_error['reason']})", "missing_fields": "Results from AI Vision"})
-                    return contacts_out, errors_out, bool(errors_out and not contacts_out)
+                for contact in contacts:
+                    missing = [f.capitalize() for f in ["email", "phone", "city", "state", "contractor", "sub_contractor"] if not contact.get(f)]
+                    if missing and len(missing) >= 4:
+                        errors_out.append({"filename": filename, "reason": "Incomplete Gemini extraction - most fields missing", "missing_fields": ", ".join(missing)})
+                    contact["source_filename"] = filename
+                    contacts_out.append(contact)
 
-                # Step 3: Both failed
-                reason = vision_error or (text_error.get("reason") if text_error else "No contact information found")
-                errors_out.append({"filename": filename, "reason": f"All extraction methods failed: {reason}", "missing_fields": "All fields"})
-                return contacts_out, errors_out, True
+                return contacts_out, errors_out, bool(errors_out and not contacts_out)
 
             except Exception as e:
                 logger.error(f"Error processing {filename}: {e}")
                 errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
                 return contacts_out, errors_out, True
+
+        # --- Previous multi-step extraction (Claude/GPT text + vision) preserved but not invoked ---
+        # To switch back: replace process_single_file above with the original from before Gemini integration
 
         CONCURRENT = 6
         stopped = False
