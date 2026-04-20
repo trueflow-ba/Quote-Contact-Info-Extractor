@@ -69,13 +69,29 @@ def put_object(path: str, data: bytes, content_type: str) -> dict:
     key = init_storage()
     if not key:
         raise HTTPException(status_code=500, detail="Storage not initialized")
-    resp = http_requests.put(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key, "Content-Type": content_type},
-        data=data, timeout=120
-    )
-    resp.raise_for_status()
-    return resp.json()
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = http_requests.put(
+                f"{STORAGE_URL}/objects/{path}",
+                headers={"X-Storage-Key": key, "Content-Type": content_type},
+                data=data, timeout=120
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
+                # Re-init storage key in case it expired
+                global storage_key
+                storage_key = None
+                try:
+                    init_storage()
+                except:
+                    pass
+    raise last_err
 
 def get_object(path: str) -> bytes:
     key = init_storage()
@@ -517,30 +533,38 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     async def upload_to_storage():
         try:
             file_records = []
+            failed_uploads = 0
             for idx, (filename, pdf_data) in enumerate(pdf_buffers):
                 storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
-                put_object(storage_path, pdf_data, "application/pdf")
-                file_records.append({
-                    "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
-                    "storage_path": storage_path, "original_filename": filename,
-                    "content_type": "application/pdf", "size": len(pdf_data),
-                    "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
-                })
+                try:
+                    put_object(storage_path, pdf_data, "application/pdf")
+                    file_records.append({
+                        "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                        "storage_path": storage_path, "original_filename": filename,
+                        "content_type": "application/pdf", "size": len(pdf_data),
+                        "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to upload {filename} to storage: {e}")
+                    failed_uploads += 1
                 if (idx + 1) % 10 == 0 or idx == len(pdf_buffers) - 1:
-                    pct = int((idx + 1) / total_files * 50)  # upload is 0-50%
+                    pct = int((idx + 1) / total_files * 50)
                     await db.progress.update_one(
                         {"run_id": run_id},
                         {"$set": {"processed_files": idx + 1, "percentage": pct, "message": f"Uploading {idx + 1}/{total_files} to storage..."}}
                     )
             if file_records:
                 await db.files.insert_many(file_records)
-            await db.runs.update_one({"id": run_id}, {"$set": {"status": "uploaded"}})
+            actual = len(file_records)
+            await db.runs.update_one({"id": run_id}, {"$set": {"status": "uploaded", "total_files": actual}})
+            msg = f"Upload complete. {actual} PDFs ready for extraction."
+            if failed_uploads:
+                msg += f" ({failed_uploads} failed to upload)"
             await db.progress.update_one(
                 {"run_id": run_id},
-                {"$set": {"status": "uploaded", "percentage": 50, "message": f"Upload complete. {total_files} PDFs ready for extraction."}}
+                {"$set": {"status": "uploaded", "total_files": actual, "percentage": 50, "message": msg}}
             )
-            logger.info(f"Upload complete for run {run_id}: {total_files} files stored")
-            # Auto-cleanup old storage
+            logger.info(f"Upload complete for run {run_id}: {actual} stored, {failed_uploads} failed")
             await run_storage_cleanup()
         except Exception as e:
             logger.error(f"Upload to storage failed for run {run_id}: {e}")
