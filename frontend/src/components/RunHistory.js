@@ -129,6 +129,17 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                       )}
                     </>
                   )}
+                  {(run.status === 'uploaded') && (
+                    <button
+                      onClick={(e) => handleRetry(e, run.id)}
+                      disabled={retrying === run.id}
+                      className="text-xs bg-sky-500/10 border border-sky-500/20 text-sky-400 hover:bg-sky-500 hover:text-white rounded-sm px-3 py-1 transition-colors inline-flex items-center gap-1 disabled:opacity-50"
+                      data-testid={`extract-run-${run.id}`}
+                    >
+                      <RotateCcw className={`h-3 w-3 ${retrying === run.id ? 'animate-spin' : ''}`} />
+                      Extract
+                    </button>
+                  )}
                   {(run.status === 'stale' || run.status === 'failed' || run.status === 'paused') && (
                     <button
                       onClick={(e) => handleRetry(e, run.id)}
