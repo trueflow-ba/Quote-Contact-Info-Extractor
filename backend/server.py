@@ -699,7 +699,7 @@ async def extract_contacts_with_ai(text: str, ai_model: str, api_key: str):
     chat = LlmChat(
         api_key=api_key,
         session_id=f"extract-{uuid.uuid4()}",
-        system_message="You are a data extraction specialist for construction industry documents. Extract contact information accurately. Always return valid JSON."
+        system_message="You are a data extraction specialist for construction industry documents. Extract contact information accurately. Always return valid JSON. After processing, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."
     ).with_model(provider, model)
     max_chars = 50000
     truncated = text[:max_chars] if len(text) > max_chars else text
@@ -775,7 +775,7 @@ async def extract_contacts_with_ai_vision(pdf_bytes: bytes, filename: str, ai_mo
     chat = LlmChat(
         api_key=api_key,
         session_id=f"vision-{uuid.uuid4()}",
-        system_message="You are a data extraction specialist for construction industry documents. You are looking at scanned document images. Extract contact information by reading the images directly. Always return valid JSON."
+        system_message="You are a data extraction specialist for construction industry documents. You are looking at scanned document images. Extract contact information by reading the images directly. Always return valid JSON. After processing, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."
     ).with_model(provider, model)
 
     all_contacts = []
@@ -892,7 +892,9 @@ IMPORTANT RULES:
 - Phone: verify digits (5≠S, 0≠O, 1≠I)
 - Email: must contain @ and a domain
 - If a field is not found, use empty string ""
-- Return ONLY the JSON array. No markdown. No explanation."""
+- Return ONLY the JSON array. No markdown. No explanation.
+
+PRIVACY: After processing this file for the requested analysis, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."""
 
 async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
     """Use Gemini vision to directly analyze PDF pages and extract contacts."""
@@ -907,7 +909,7 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
     chat = LlmChat(
         api_key=api_key,
         session_id=f"gemini-{uuid.uuid4()}",
-        system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images with extreme attention to detail, reading ALL text on the page including small print, headers, footers, and address fields. You ALWAYS identify both the contractor (receiving party) and sub-contractor (sending party). Always return valid JSON."
+        system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images with extreme attention to detail, reading ALL text on the page including small print, headers, footers, and address fields. You ALWAYS identify both the contractor (receiving party) and sub-contractor (sending party). Always return valid JSON. After processing, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."
     ).with_model("gemini", "gemini-2.5-flash")
 
     # Send up to 8 pages to Gemini (it handles large context well)
