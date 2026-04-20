@@ -18,6 +18,9 @@ const ALL_FIELDS = [
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
   { key: 'bid_by', label: 'Bid By' },
+  { key: 'customer_contact_name', label: 'Customer Contact' },
+  { key: 'customer_business', label: 'Customer Business' },
+  { key: 'customer_address', label: 'Customer Address' },
   { key: 'source_filename', label: 'Source File' },
   { key: 'import_date', label: 'Import Date' },
 ];
@@ -34,6 +37,9 @@ const GROUPED_COLUMNS = [
   { key: 'phone', label: 'Phone' },
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
+  { key: 'customer_contact_name', label: 'Customer Contact' },
+  { key: 'customer_business', label: 'Customer Business' },
+  { key: 'customer_address', label: 'Customer Address' },
   { key: 'import_date', label: 'Import Date' },
 ];
 

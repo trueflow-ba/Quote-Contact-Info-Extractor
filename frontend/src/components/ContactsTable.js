@@ -17,6 +17,9 @@ const flatColumns = [
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
   { key: 'bid_by', label: 'Bid By' },
+  { key: 'customer_contact_name', label: 'Customer Contact' },
+  { key: 'customer_business', label: 'Customer Business' },
+  { key: 'customer_address', label: 'Customer Address' },
   { key: 'source_filename', label: 'Source' },
 ];
 
@@ -32,6 +35,9 @@ const groupedColumns = [
   { key: 'phone', label: 'Phone' },
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
+  { key: 'customer_contact_name', label: 'Customer Contact' },
+  { key: 'customer_business', label: 'Customer Business' },
+  { key: 'customer_address', label: 'Customer Address' },
 ];
 
 export default function ContactsTable({ contacts, runId }) {
@@ -97,9 +103,9 @@ export default function ContactsTable({ contacts, runId }) {
 
   const downloadGroupedCSV = () => {
     if (!groupedData?.length) return;
-    const headers = ['Sub-Contractor', 'Bid By', 'Count', 'Contractor', 'Quote Amount', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State'];
+    const headers = ['Sub-Contractor', 'Bid By', 'Count', 'Contractor', 'Quote Amount', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State', 'Customer Contact', 'Customer Business', 'Customer Address'];
     const esc = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
-    const rows = groupedData.map(c => [c.sub_contractor, c.bid_by, c.count, c.contractor, c.quote_amount, c.first_name, c.last_name, c.email, c.phone, c.city, c.state].map(esc).join(','));
+    const rows = groupedData.map(c => [c.sub_contractor, c.bid_by, c.count, c.contractor, c.quote_amount, c.first_name, c.last_name, c.email, c.phone, c.city, c.state, c.customer_contact_name, c.customer_business, c.customer_address].map(esc).join(','));
     const csv = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);

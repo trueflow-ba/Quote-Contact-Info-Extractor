@@ -853,7 +853,7 @@ Document: {filename}"""
 # =============================================================================
 GEMINI_EXTRACTION_PROMPT = """You are analyzing a construction bid/quote document. Extract ALL contact information visible.
 
-CRITICAL: This document is a quote or bid from a sub-contractor TO a general contractor. You MUST identify BOTH parties:
+CRITICAL: This document is a quote or bid from a sub-contractor TO a general contractor. You MUST identify ALL parties:
 - The CONTRACTOR (general contractor) who is RECEIVING this quote — look carefully in ALL of these locations:
   * "Attention:", "Attn:", "To:", "Submitted To:", "Customer:", "Proposal For:", "Quoted To:", "Bill To:" fields
   * Page header or top-right address block
@@ -864,6 +864,10 @@ CRITICAL: This document is a quote or bid from a sub-contractor TO a general con
   * The company whose letterhead/logo appears on the document
   * "From:", "Submitted By:", "Vendor:", "Prepared By:" fields
   * The company providing services, materials, or labor
+- The CUSTOMER / END CLIENT — the property owner or end client for the project:
+  * "Ship To:", "Project For:", "Owner:", "Client:", "Property:", "Job Name:" fields
+  * Sometimes listed as the project owner or site contact
+  * This is the party who ultimately owns the project or property
 
 Return a JSON array of contact objects. Each object must have exactly these fields:
 - "city": string
@@ -872,6 +876,9 @@ Return a JSON array of contact objects. Each object must have exactly these fiel
 - "bid_by": string (full name of person placing/sending the bid)
 - "contractor": string (general contractor company name RECEIVING the quote. LOOK CAREFULLY - it is almost always present somewhere on the document even if in small text.)
 - "sub_contractor": string (sub-contractor/vendor company SENDING the quote)
+- "customer_contact_name": string (first and last name of the customer/end client/property owner contact, if present)
+- "customer_business": string (customer/end client business or property name, if present)
+- "customer_address": string (customer/end client full address — street, city, state, zip — if present)
 - "last_name": string (of the sub-contractor contact)
 - "first_name": string (of the sub-contractor contact)
 - "email": string
@@ -880,7 +887,8 @@ Return a JSON array of contact objects. Each object must have exactly these fiel
 IMPORTANT RULES:
 - On single-page quotes, the contractor name is often in a small "Attn" or "To" field near the top — read ALL text carefully, including small/fine print
 - If you see "Horizon" or any company name in an address-to field, that is the CONTRACTOR
-- "Ship To" or "Project" or "Job Site" = location, not a company contact
+- "Ship To", "Project", "Job Site", "Owner" sections contain CUSTOMER info — extract into customer fields
+- Customer fields may be blank on many documents — that is fine, use empty string ""
 - Phone: verify digits (5≠S, 0≠O, 1≠I)
 - Email: must contain @ and a domain
 - If a field is not found, use empty string ""
@@ -933,6 +941,9 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
                 "bid_by": str(c.get("bid_by", "")),
                 "contractor": str(c.get("contractor", "")),
                 "sub_contractor": str(c.get("sub_contractor", "")),
+                "customer_contact_name": str(c.get("customer_contact_name", "")),
+                "customer_business": str(c.get("customer_business", "")),
+                "customer_address": str(c.get("customer_address", "")),
                 "last_name": str(c.get("last_name", "")),
                 "first_name": str(c.get("first_name", "")),
                 "email": str(c.get("email", "")),
@@ -1391,6 +1402,8 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     field_map = {
         "city": "City", "state": "State", "quote_amount": "Quote Amount",
         "bid_by": "Bid By", "contractor": "Contractor", "sub_contractor": "Sub-Contractor",
+        "customer_contact_name": "Customer Contact", "customer_business": "Customer Business",
+        "customer_address": "Customer Address",
         "last_name": "Last Name", "first_name": "First Name", "email": "Email",
         "phone": "Phone", "source_filename": "Source File", "import_date": "Import Date",
         "run_id": "Run ID",
@@ -1417,9 +1430,9 @@ async def download_contacts_csv(run_id: str, request: Request):
     contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Contractor", "Sub-Contractor", "Last Name", "First Name", "Email", "Phone", "Source File"])
+    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Contractor", "Sub-Contractor", "Customer Contact", "Customer Business", "Customer Address", "Last Name", "First Name", "Email", "Phone", "Source File"])
     for c in contacts:
-        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("contractor",""), c.get("sub_contractor",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
+        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("contractor",""), c.get("sub_contractor",""), c.get("customer_contact_name",""), c.get("customer_business",""), c.get("customer_address",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
