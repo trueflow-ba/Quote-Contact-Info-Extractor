@@ -1025,6 +1025,7 @@ CRITICAL: This document is a quote or bid from a sub-contractor TO a general con
   * The company whose letterhead/logo appears on the document
   * "From:", "Submitted By:", "Vendor:", "Prepared By:" fields
   * The company providing services, materials, or labor
+  * Their street address is usually printed DIRECTLY BELOW the company name/logo at the top, or in a footer. You MUST capture it into the "address" field.
 - The CUSTOMER / END CLIENT — the property owner or end client for the project:
   * "Ship To:", "Project For:", "Owner:", "Client:", "Property:", "Job Name:" fields
   * Sometimes listed as the project owner or site contact
@@ -1040,7 +1041,7 @@ Return a JSON array of contact objects. Each object must have exactly these fiel
 - "customer_contact_name": string (first and last name of the customer/end client/property owner contact, if present)
 - "customer_business": string (customer/end client business or property name, if present)
 - "customer_address": string (customer/end client full address — street, city, state, zip — if present)
-- "address": string (SUB-CONTRACTOR street address ONLY — street number and name, and suite/unit/PO Box if present. DO NOT include city, state, or zip in this field. Example: "1234 Main St, Suite 200" or "PO Box 4567". Empty string if not found.)
+- "address": string (THE SUB-CONTRACTOR'S street address — this is almost always printed on the letterhead/logo block at the TOP of the page, or in the footer. Extract ONLY the street number + street name, plus suite/unit/floor/PO Box if given. DO NOT include city, state, or zip. Examples of GOOD values: "1234 Main St", "1234 Main St, Suite 200", "PO Box 4567", "500 Industrial Blvd Unit 12". Examples of BAD values (never include): "1234 Main St, Dallas, TX 75201" (has city/state/zip), "Dallas, TX" (missing street). If no street address is shown for the sub-contractor, use empty string "".)
 - "last_name": string (of the sub-contractor contact)
 - "first_name": string (of the sub-contractor contact)
 - "email": string
@@ -1051,6 +1052,13 @@ IMPORTANT RULES:
 - If you see "Horizon" or any company name in an address-to field, that is the CONTRACTOR
 - "Ship To", "Project", "Job Site", "Owner" sections contain CUSTOMER info — extract into customer fields
 - SUB-CONTRACTOR "address" field: ONLY the street/suite/PO Box. NEVER include city, state, or zip here — those go in their own "city"/"state" fields.
+- ADDRESS SEARCH CHECKLIST — before returning, scan these locations for the sub-contractor's street address:
+    1. Directly under the company name/logo at the top of page 1
+    2. In the document letterhead (header block, often with logo)
+    3. In the document footer (bottom of page 1)
+    4. In a "Return Address" or "Remit To" block
+    5. Next to the sub-contractor's phone/email block
+  If you find text like "1234 Main St \n Dallas, TX 75201", extract ONLY "1234 Main St" into "address". Put "Dallas" into "city" and "TX" into "state".
 - Customer fields may be blank on many documents — that is fine, use empty string ""
 - Phone: verify digits (5≠S, 0≠O, 1≠I)
 - Email: must contain @ and a domain

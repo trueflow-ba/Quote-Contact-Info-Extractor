@@ -58,8 +58,8 @@ export default function AllContactsTable() {
   const [filters, setFilters] = useState({});
   const [showExport, setShowExport] = useState(false);
 
-  const flatOrder = useColumnOrder(ALL_FIELDS, 'all-contacts-flat-cols-v2');
-  const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'all-contacts-grouped-cols-v2');
+  const flatOrder = useColumnOrder(ALL_FIELDS, 'all-contacts-flat-cols-v3');
+  const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'all-contacts-grouped-cols-v3');
   const active = grouped ? groupedOrder : flatOrder;
   const activeColumns = active.columns;
 
