@@ -1025,15 +1025,42 @@ IMPORTANT RULES:
 
 PRIVACY: After processing this file for the requested analysis, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."""
 
-async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
-    """Use Gemini vision to directly analyze PDF pages and extract contacts."""
+def _parse_gemini_contacts_response(response: str, filename: str):
+    """Parse Gemini JSON response into a normalized list of contacts."""
+    cleaned = response.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+    contacts = json.loads(cleaned)
+    if not isinstance(contacts, list):
+        contacts = [contacts] if isinstance(contacts, dict) else []
+    valid = []
+    for c in contacts:
+        if not isinstance(c, dict):
+            continue
+        valid.append({
+            "city": str(c.get("city", "")),
+            "state": str(c.get("state", "")),
+            "quote_amount": str(c.get("quote_amount", "")),
+            "bid_by": str(c.get("bid_by", "")),
+            "contractor": str(c.get("contractor", "")),
+            "sub_contractor": str(c.get("sub_contractor", "")),
+            "customer_contact_name": str(c.get("customer_contact_name", "")),
+            "customer_business": str(c.get("customer_business", "")),
+            "customer_address": str(c.get("customer_address", "")),
+            "last_name": str(c.get("last_name", "")),
+            "first_name": str(c.get("first_name", "")),
+            "email": str(c.get("email", "")),
+            "phone": str(c.get("phone", "")),
+        })
+    return valid
+
+
+async def extract_contacts_with_gemini_from_images(images, filename: str, api_key: str):
+    """Run Gemini 2.5 Flash vision on a list of PIL images."""
     import base64
-    from pdf2image import convert_from_bytes
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=250, fmt="jpeg")
-    except Exception as e:
-        logger.error(f"PDF to image failed for Gemini on {filename}: {e}")
-        return [], f"Could not convert PDF to images: {e}"
+    if not images:
+        return [], "No images to analyze"
 
     chat = LlmChat(
         api_key=api_key,
@@ -1041,7 +1068,6 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
         system_message="You are an expert data extraction specialist for construction industry bid documents. You analyze document images with extreme attention to detail, reading ALL text on the page including small print, headers, footers, and address fields. You ALWAYS identify both the contractor (receiving party) and sub-contractor (sending party). Always return valid JSON. After processing, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."
     ).with_model("gemini", "gemini-2.5-flash")
 
-    # Send up to 8 pages to Gemini (it handles large context well)
     pages_to_scan = images[:8]
     image_contents = []
     for img in pages_to_scan:
@@ -1054,39 +1080,53 @@ async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key:
 
     try:
         response = await chat.send_message(UserMessage(text=prompt, file_contents=image_contents))
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
-        contacts = json.loads(cleaned)
-        if not isinstance(contacts, list):
-            contacts = [contacts] if isinstance(contacts, dict) else []
-        valid = []
-        for c in contacts:
-            if not isinstance(c, dict):
-                continue
-            valid.append({
-                "city": str(c.get("city", "")),
-                "state": str(c.get("state", "")),
-                "quote_amount": str(c.get("quote_amount", "")),
-                "bid_by": str(c.get("bid_by", "")),
-                "contractor": str(c.get("contractor", "")),
-                "sub_contractor": str(c.get("sub_contractor", "")),
-                "customer_contact_name": str(c.get("customer_contact_name", "")),
-                "customer_business": str(c.get("customer_business", "")),
-                "customer_address": str(c.get("customer_address", "")),
-                "last_name": str(c.get("last_name", "")),
-                "first_name": str(c.get("first_name", "")),
-                "email": str(c.get("email", "")),
-                "phone": str(c.get("phone", "")),
-            })
-        logger.info(f"Gemini extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages)")
+        valid = _parse_gemini_contacts_response(response, filename)
+        logger.info(f"Gemini vision extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages)")
         return valid, None
     except json.JSONDecodeError as e:
         logger.error(f"Gemini returned invalid JSON for {filename}: {e}")
         return [], "Gemini returned invalid response format"
     except Exception as e:
-        logger.error(f"Gemini extraction failed for {filename}: {e}")
+        logger.error(f"Gemini vision extraction failed for {filename}: {e}")
+        return [], str(e)
+
+
+async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
+    """Use Gemini vision to directly analyze PDF pages and extract contacts."""
+    from pdf2image import convert_from_bytes
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=250, fmt="jpeg")
+    except Exception as e:
+        logger.error(f"PDF to image failed for Gemini on {filename}: {e}")
+        return [], f"Could not convert PDF to images: {e}"
+    return await extract_contacts_with_gemini_from_images(images, filename, api_key)
+
+
+async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: str):
+    """Use Gemini 2.5 Flash on raw text (for DOCX/XLSX text-first path)."""
+    if not text or len(text.strip()) < 10:
+        return [], "No meaningful text content to extract contacts from"
+
+    chat = LlmChat(
+        api_key=api_key,
+        session_id=f"gemini-txt-{uuid.uuid4()}",
+        system_message="You are an expert data extraction specialist for construction industry bid documents. Extract contact information accurately from the provided document text. Always return valid JSON. After processing, immediately purge all specific data (names, addresses, PII) from your active context."
+    ).with_model("gemini", "gemini-2.5-flash")
+
+    max_chars = 80000
+    truncated = text[:max_chars] if len(text) > max_chars else text
+    prompt = f"{GEMINI_EXTRACTION_PROMPT}\n\nDocument filename: {filename}\n\nDocument text:\n{truncated}"
+
+    try:
+        response = await chat.send_message(UserMessage(text=prompt))
+        valid = _parse_gemini_contacts_response(response, filename)
+        logger.info(f"Gemini text extracted {len(valid)} contacts from {filename} ({len(truncated)} chars)")
+        return valid, None
+    except json.JSONDecodeError as e:
+        logger.error(f"Gemini text returned invalid JSON for {filename}: {e}")
+        return [], "Gemini returned invalid response format"
+    except Exception as e:
+        logger.error(f"Gemini text extraction failed for {filename}: {e}")
         return [], str(e)
 
 async def process_run(run_id: str, user_id: str):
@@ -1126,17 +1166,49 @@ async def process_run(run_id: str, user_id: str):
         )
 
         async def process_single_file(file_record):
-            """Process a single PDF using Gemini vision directly."""
+            """Process a single file (PDF/DOCX/XLSX) using Gemini."""
             filename = file_record["original_filename"]
             contacts_out, errors_out = [], []
             try:
-                pdf_bytes = get_object(file_record["storage_path"])
-                if len(pdf_bytes) > PDF_SIZE_THRESHOLD:
-                    pdf_bytes = compress_pdf(pdf_bytes, filename)
-
-                # Pure Gemini vision extraction — send PDF pages as images
+                file_bytes = get_object(file_record["storage_path"])
                 gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
-                contacts, gemini_error = await extract_contacts_with_gemini(pdf_bytes, filename, gemini_key)
+                ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+
+                if ext in ('docx', 'doc'):
+                    # Step 1: text extraction via python-docx (only for .docx)
+                    text = None
+                    if ext == 'docx':
+                        text, _ = extract_text_from_docx(file_bytes, filename)
+                    contacts, gemini_error = [], None
+                    if text:
+                        contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
+                    # Step 2: vision fallback only if ZERO contacts
+                    if not contacts:
+                        logger.info(f"DOC fallback to vision for {filename}")
+                        images, conv_err = convert_doc_to_images(file_bytes, filename, f".{ext}")
+                        if images:
+                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
+                        elif gemini_error is None:
+                            gemini_error = conv_err or "LibreOffice conversion failed"
+                elif ext in ('xlsx', 'xls'):
+                    text = None
+                    if ext == 'xlsx':
+                        text, _ = extract_text_from_xlsx(file_bytes, filename)
+                    contacts, gemini_error = [], None
+                    if text:
+                        contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
+                    if not contacts:
+                        logger.info(f"XLS fallback to vision for {filename}")
+                        images, conv_err = convert_doc_to_images(file_bytes, filename, f".{ext}")
+                        if images:
+                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
+                        elif gemini_error is None:
+                            gemini_error = conv_err or "LibreOffice conversion failed"
+                else:
+                    # PDF path (default)
+                    if len(file_bytes) > PDF_SIZE_THRESHOLD:
+                        file_bytes = compress_pdf(file_bytes, filename)
+                    contacts, gemini_error = await extract_contacts_with_gemini(file_bytes, filename, gemini_key)
 
                 if gemini_error and not contacts:
                     errors_out.append({"filename": filename, "reason": f"Gemini extraction failed: {gemini_error}", "missing_fields": "All fields"})
