@@ -1040,6 +1040,7 @@ Return a JSON array of contact objects. Each object must have exactly these fiel
 - "customer_contact_name": string (first and last name of the customer/end client/property owner contact, if present)
 - "customer_business": string (customer/end client business or property name, if present)
 - "customer_address": string (customer/end client full address — street, city, state, zip — if present)
+- "address": string (SUB-CONTRACTOR street address ONLY — street number and name, and suite/unit/PO Box if present. DO NOT include city, state, or zip in this field. Example: "1234 Main St, Suite 200" or "PO Box 4567". Empty string if not found.)
 - "last_name": string (of the sub-contractor contact)
 - "first_name": string (of the sub-contractor contact)
 - "email": string
@@ -1049,6 +1050,7 @@ IMPORTANT RULES:
 - On single-page quotes, the contractor name is often in a small "Attn" or "To" field near the top — read ALL text carefully, including small/fine print
 - If you see "Horizon" or any company name in an address-to field, that is the CONTRACTOR
 - "Ship To", "Project", "Job Site", "Owner" sections contain CUSTOMER info — extract into customer fields
+- SUB-CONTRACTOR "address" field: ONLY the street/suite/PO Box. NEVER include city, state, or zip here — those go in their own "city"/"state" fields.
 - Customer fields may be blank on many documents — that is fine, use empty string ""
 - Phone: verify digits (5≠S, 0≠O, 1≠I)
 - Email: must contain @ and a domain
@@ -1080,6 +1082,7 @@ def _parse_gemini_contacts_response(response: str, filename: str):
             "customer_contact_name": str(c.get("customer_contact_name", "")),
             "customer_business": str(c.get("customer_business", "")),
             "customer_address": str(c.get("customer_address", "")),
+            "address": str(c.get("address", "")),
             "last_name": str(c.get("last_name", "")),
             "first_name": str(c.get("first_name", "")),
             "email": str(c.get("email", "")),
@@ -1663,6 +1666,7 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
         "csi": "CSI",
         "city": "City", "state": "State", "quote_amount": "Quote Amount",
         "bid_by": "Bid By", "contractor": "Contractor", "sub_contractor": "Sub-Contractor",
+        "address": "Address",
         "customer_contact_name": "Customer Contact", "customer_business": "Customer Business",
         "customer_address": "Customer Address",
         "last_name": "Last Name", "first_name": "First Name", "email": "Email",

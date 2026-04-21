@@ -8,36 +8,38 @@ import api from '@/lib/api';
 import { toast } from 'sonner';
 
 const FLAT_COLUMNS = [
-  { key: 'csi', label: 'CSI' },
+  { key: 'sub_contractor', label: 'Sub-Contractor' },
+  { key: 'bid_by', label: 'Bid By' },
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
-  { key: 'contractor', label: 'Contractor' },
-  { key: 'sub_contractor', label: 'Sub-Contractor' },
-  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
+  { key: 'address', label: 'Address' },
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
-  { key: 'bid_by', label: 'Bid By' },
+  { key: 'csi', label: 'CSI' },
+  { key: 'contractor', label: 'Contractor' },
+  { key: 'quote_amount', label: 'Quote Amount' },
+  { key: 'source_filename', label: 'Source File' },
   { key: 'customer_contact_name', label: 'Customer Contact' },
   { key: 'customer_business', label: 'Customer Business' },
   { key: 'customer_address', label: 'Customer Address' },
-  { key: 'source_filename', label: 'Source' },
 ];
 
 const GROUPED_COLUMNS = [
-  { key: 'csi', label: 'CSI' },
   { key: 'sub_contractor', label: 'Sub-Contractor' },
   { key: 'bid_by', label: 'Bid By' },
   { key: 'count', label: 'Count' },
-  { key: 'contractor', label: 'Contractor' },
-  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
+  { key: 'address', label: 'Address' },
   { key: 'city', label: 'City' },
   { key: 'state', label: 'State' },
+  { key: 'csi', label: 'CSI' },
+  { key: 'contractor', label: 'Contractor' },
+  { key: 'quote_amount', label: 'Quote Amount' },
   { key: 'customer_contact_name', label: 'Customer Contact' },
   { key: 'customer_business', label: 'Customer Business' },
   { key: 'customer_address', label: 'Customer Address' },
@@ -50,8 +52,8 @@ export default function ContactsTable({ contacts, runId }) {
   const [grouped, setGrouped] = useState(false);
   const [filters, setFilters] = useState({});
 
-  const flatOrder = useColumnOrder(FLAT_COLUMNS, 'contacts-table-flat-cols');
-  const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'contacts-table-grouped-cols');
+  const flatOrder = useColumnOrder(FLAT_COLUMNS, 'contacts-table-flat-cols-v2');
+  const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'contacts-table-grouped-cols-v2');
   const active = grouped ? groupedOrder : flatOrder;
 
   const handleSort = (key) => {
