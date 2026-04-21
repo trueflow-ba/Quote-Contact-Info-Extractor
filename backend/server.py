@@ -1396,24 +1396,38 @@ async def get_run_charts(run_id: str, request: Request):
     state_data = sorted([{"name": k, "count": v} for k, v in state_counts.items()], key=lambda x: -x["count"])[:20]
     return {"by_city": city_data, "by_state": state_data}
 
-@api_router.get("/contacts/all")
-async def get_all_contacts(request: Request):
-    """Get all unique contacts across all runs for this user, with import date."""
-    user = await get_current_user(request)
-    contacts = await db.contacts.find({"user_id": user["_id"]}, {"_id": 0}).sort("created_at", 1).to_list(50000)
-    # Attach run date as import_date from the run's created_at
+async def get_all_user_contacts(user_id: str):
+    """Get all contacts for a user: finalized contacts + live raw_contacts from in-progress runs."""
+    # Finalized contacts from completed runs
+    contacts = await db.contacts.find({"user_id": user_id}, {"_id": 0}).sort("created_at", 1).to_list(50000)
+    finalized_run_ids = set(c.get("run_id", "") for c in contacts)
+    # Add raw_contacts from runs that haven't completed yet (processing/paused)
+    active_runs = await db.runs.find(
+        {"user_id": user_id, "status": {"$in": ["processing", "paused", "pausing", "uploading", "uploaded"]}},
+        {"_id": 0, "id": 1}
+    ).to_list(100)
+    active_ids = [r["id"] for r in active_runs if r["id"] not in finalized_run_ids]
+    if active_ids:
+        raw = await db.raw_contacts.find({"user_id": user_id, "run_id": {"$in": active_ids}}, {"_id": 0}).sort("created_at", 1).to_list(50000)
+        contacts.extend(raw)
+    # Attach import dates
     run_dates = {}
-    runs = await db.runs.find({"user_id": user["_id"]}, {"_id": 0, "id": 1, "created_at": 1}).to_list(500)
+    runs = await db.runs.find({"user_id": user_id}, {"_id": 0, "id": 1, "created_at": 1}).to_list(500)
     for r in runs:
         run_dates[r["id"]] = r.get("created_at", "")
     for c in contacts:
         c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
     return contacts
 
+@api_router.get("/contacts/all")
+async def get_all_contacts(request: Request):
+    user = await get_current_user(request)
+    return await get_all_user_contacts(user["_id"])
+
 @api_router.get("/contacts/all/charts")
 async def get_all_contacts_charts(request: Request):
     user = await get_current_user(request)
-    contacts = await db.contacts.find({"user_id": user["_id"]}, {"_id": 0}).to_list(50000)
+    contacts = await get_all_user_contacts(user["_id"])
     city_counts = {}
     state_counts = {}
     for c in contacts:
@@ -1437,9 +1451,14 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     user = await get_current_user(request)
     query = {"user_id": user["_id"]}
     if input.run_id:
-        query["run_id"] = input.run_id
-    contacts = await db.contacts.find(query, {"_id": 0}).sort("created_at", 1).to_list(50000)
-    # Map import_date
+        # Per-run: check if run is in progress, use raw_contacts if so
+        run = await db.runs.find_one({"id": input.run_id, "user_id": user["_id"]}, {"_id": 0, "status": 1})
+        if run and run.get("status") in ("processing", "paused", "pausing"):
+            contacts = await db.raw_contacts.find({"run_id": input.run_id, "user_id": user["_id"]}, {"_id": 0}).sort("created_at", 1).to_list(50000)
+        else:
+            contacts = await db.contacts.find({"run_id": input.run_id, "user_id": user["_id"]}, {"_id": 0}).sort("created_at", 1).to_list(50000)
+    else:
+        contacts = await get_all_user_contacts(user["_id"])
     run_dates = {}
     runs = await db.runs.find({"user_id": user["_id"]}, {"_id": 0, "id": 1, "created_at": 1}).to_list(500)
     for r in runs:
@@ -1472,7 +1491,12 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
 @api_router.get("/runs/{run_id}/download/contacts")
 async def download_contacts_csv(run_id: str, request: Request):
     user = await get_current_user(request)
-    contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(5000)
+    # Use raw_contacts if run is still in progress
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0, "status": 1})
+    if run and run.get("status") in ("processing", "paused", "pausing"):
+        contacts = await db.raw_contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
+    else:
+        contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["City", "State", "Quote Amount", "Bid By", "Contractor", "Sub-Contractor", "Customer Contact", "Customer Business", "Customer Address", "Last Name", "First Name", "Email", "Phone", "Source File"])
