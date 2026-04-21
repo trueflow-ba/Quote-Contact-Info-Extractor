@@ -17,8 +17,8 @@ function ProtectedRoute({ children, adminOnly }) {
     );
   }
   if (!user) return <Navigate to="/login" replace />;
-  // Force password change for admin on first login
-  if (user.must_change_password && window.location.pathname !== '/admin') {
+  // Force password change for ADMIN on first login (non-admins can't access /admin)
+  if (user.must_change_password && user.role === 'admin' && window.location.pathname !== '/admin') {
     return <Navigate to="/admin" replace />;
   }
   if (adminOnly && user.role !== 'admin') return <Navigate to="/" replace />;
@@ -36,7 +36,7 @@ function AppRoutes() {
   }
   return (
     <Routes>
-      <Route path="/login" element={user ? (user.must_change_password ? <Navigate to="/admin" replace /> : <Navigate to="/" replace />) : <LoginPage />} />
+      <Route path="/login" element={user ? (user.must_change_password && user.role === 'admin' ? <Navigate to="/admin" replace /> : <Navigate to="/" replace />) : <LoginPage />} />
       <Route path="/" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="/admin" element={<ProtectedRoute adminOnly><AdminPage /></ProtectedRoute>} />
