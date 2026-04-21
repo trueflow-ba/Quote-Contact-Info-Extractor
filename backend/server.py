@@ -485,29 +485,33 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     pdf_buffers = []  # list of (filename, bytes)
     rejected_files = []
 
+    SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls')
+
     for file in files:
         data = await file.read()
-        if file.filename.lower().endswith(".zip"):
+        fname_lower = file.filename.lower()
+        if fname_lower.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for name in zf.namelist():
-                        if name.lower().endswith(".pdf") and not name.startswith("__MACOSX"):
+                        nlower = name.lower()
+                        if any(nlower.endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not name.startswith("__MACOSX"):
                             if len(pdf_buffers) >= max_pdfs:
                                 rejected_files.append(name.split("/")[-1])
                                 continue
                             pdf_buffers.append((name.split("/")[-1], zf.read(name)))
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
-        elif file.filename.lower().endswith(".pdf"):
+        elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             if len(pdf_buffers) >= max_pdfs:
                 rejected_files.append(file.filename)
                 continue
             pdf_buffers.append((file.filename, data))
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Only PDF and ZIP files are accepted.")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Accepted: PDF, DOCX, XLSX, and ZIP files.")
 
     if not pdf_buffers:
-        raise HTTPException(status_code=400, detail="No PDF files found in upload")
+        raise HTTPException(status_code=400, detail="No supported files found in upload")
 
     total_files = len(pdf_buffers)
 
@@ -525,7 +529,7 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     await db.runs.insert_one(run_doc)
     await db.progress.update_one(
         {"run_id": run_id},
-        {"$set": {"status": "uploading", "total_files": total_files, "processed_files": 0, "percentage": 0, "message": f"Uploading {total_files} PDFs to storage..."}},
+        {"$set": {"status": "uploading", "total_files": total_files, "processed_files": 0, "percentage": 0, "message": f"Uploading {total_files} files to storage..."}},
         upsert=True
     )
 
@@ -535,13 +539,17 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
             file_records = []
             failed_uploads = 0
             for idx, (filename, pdf_data) in enumerate(pdf_buffers):
-                storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.pdf"
+                ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
+                ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                          'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel'}
+                content_type = ct_map.get(ext, 'application/octet-stream')
+                storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.{ext}"
                 try:
-                    put_object(storage_path, pdf_data, "application/pdf")
+                    put_object(storage_path, pdf_data, content_type)
                     file_records.append({
                         "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
                         "storage_path": storage_path, "original_filename": filename,
-                        "content_type": "application/pdf", "size": len(pdf_data),
+                        "content_type": content_type, "size": len(pdf_data),
                         "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
                     })
                 except Exception as e:
@@ -659,6 +667,84 @@ def ocr_with_easyocr(images, filename):
     text = "\n".join(all_text).strip()
     avg_conf = (total_conf / conf_count * 100) if conf_count > 0 else 0
     return text, avg_conf
+
+# =============================================================================
+# DOCX / XLSX TEXT EXTRACTION
+# =============================================================================
+def extract_text_from_docx(file_bytes: bytes, filename: str):
+    """Extract text from DOCX files. Returns (text, error_info)."""
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        parts = []
+        # Main body paragraphs
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        # Tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    parts.append(row_text)
+        # Headers and footers
+        for section in doc.sections:
+            for header_part in [section.header, section.footer]:
+                if header_part:
+                    for para in header_part.paragraphs:
+                        if para.text.strip():
+                            parts.append(para.text)
+        text = "\n".join(parts).strip()
+        if text:
+            return text, None
+        return None, {"reason": "No text content found in DOCX", "missing_fields": "All fields"}
+    except Exception as e:
+        logger.error(f"DOCX extraction failed for {filename}: {e}")
+        return None, {"reason": f"Failed to read DOCX: {str(e)}", "missing_fields": "All fields"}
+
+def extract_text_from_xlsx(file_bytes: bytes, filename: str):
+    """Extract text from XLSX files. Returns (text, error_info)."""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            parts.append(f"--- Sheet: {sheet_name} ---")
+            for row in ws.iter_rows(values_only=True):
+                row_vals = [str(v).strip() for v in row if v is not None and str(v).strip()]
+                if row_vals:
+                    parts.append(" | ".join(row_vals))
+        text = "\n".join(parts).strip()
+        if text:
+            return text, None
+        return None, {"reason": "No data found in XLSX", "missing_fields": "All fields"}
+    except Exception as e:
+        logger.error(f"XLSX extraction failed for {filename}: {e}")
+        return None, {"reason": f"Failed to read XLSX: {str(e)}", "missing_fields": "All fields"}
+
+def convert_doc_to_images(file_bytes: bytes, filename: str, suffix: str):
+    """Convert DOCX/XLSX to images via LibreOffice for Gemini vision fallback."""
+    import subprocess, tempfile, glob
+    from pdf2image import convert_from_path
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, f"input{suffix}")
+            with open(input_path, "wb") as f:
+                f.write(file_bytes)
+            # Convert to PDF via LibreOffice
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, input_path],
+                timeout=60, capture_output=True
+            )
+            pdf_files = glob.glob(os.path.join(tmpdir, "*.pdf"))
+            if not pdf_files:
+                return None, "LibreOffice conversion to PDF failed"
+            images = convert_from_path(pdf_files[0], dpi=250)
+            return images, None
+    except Exception as e:
+        logger.error(f"Doc-to-image conversion failed for {filename}: {e}")
+        return None, str(e)
 
 async def extract_text_from_pdf(pdf_bytes: bytes, filename: str):
     try:

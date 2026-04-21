@@ -24,6 +24,7 @@ easyocr==1.7.2
 ecdsa==0.19.2
 email-validator==2.3.0
 emergentintegrations==0.1.0
+et_xmlfile==2.0.0
 fastapi==0.110.1
 fastuuid==0.14.0
 filelock==3.25.2
@@ -91,6 +92,7 @@ nvidia-nvtx==13.0.85
 oauthlib==3.3.1
 openai==1.99.9
 opencv-python-headless==4.13.0.92
+openpyxl==3.1.5
 packaging==26.0
 pandas==3.0.2
 passlib==1.7.4
@@ -122,6 +124,7 @@ pytesseract==0.3.13
 pytest==9.0.3
 python-bidi==0.6.7
 python-dateutil==2.9.0.post0
+python-docx==1.2.0
 python-dotenv==1.2.2
 python-jose==3.5.0
 python-multipart==0.0.24
