@@ -1,12 +1,14 @@
 import { useState, useMemo } from 'react';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
-import { ArrowUpDown, Search, Download, Layers, List } from 'lucide-react';
+import { ArrowUpDown, Search, Download, Layers, List, GripVertical, RotateCcw } from 'lucide-react';
 import ColumnFilter, { applyColumnFilters } from '@/components/ColumnFilter';
+import { useColumnOrder } from '@/hooks/useColumnOrder';
 import api from '@/lib/api';
 import { toast } from 'sonner';
 
-const flatColumns = [
+const FLAT_COLUMNS = [
+  { key: 'csi', label: 'CSI' },
   { key: 'first_name', label: 'First Name' },
   { key: 'last_name', label: 'Last Name' },
   { key: 'contractor', label: 'Contractor' },
@@ -23,7 +25,8 @@ const flatColumns = [
   { key: 'source_filename', label: 'Source' },
 ];
 
-const groupedColumns = [
+const GROUPED_COLUMNS = [
+  { key: 'csi', label: 'CSI' },
   { key: 'sub_contractor', label: 'Sub-Contractor' },
   { key: 'bid_by', label: 'Bid By' },
   { key: 'count', label: 'Count' },
@@ -47,6 +50,10 @@ export default function ContactsTable({ contacts, runId }) {
   const [grouped, setGrouped] = useState(false);
   const [filters, setFilters] = useState({});
 
+  const flatOrder = useColumnOrder(FLAT_COLUMNS, 'contacts-table-flat-cols');
+  const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'contacts-table-grouped-cols');
+  const active = grouped ? groupedOrder : flatOrder;
+
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     else { setSortKey(key); setSortDir('asc'); }
@@ -61,8 +68,8 @@ export default function ContactsTable({ contacts, runId }) {
     data = applyColumnFilters(data, filters);
     if (sortKey && sortKey !== 'count') {
       data = [...data].sort((a, b) => {
-        const av = (a[sortKey] || '').toLowerCase();
-        const bv = (b[sortKey] || '').toLowerCase();
+        const av = (a[sortKey] || '').toString().toLowerCase();
+        const bv = (b[sortKey] || '').toString().toLowerCase();
         return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
       });
     }
@@ -79,19 +86,29 @@ export default function ContactsTable({ contacts, runId }) {
     }
     let rows = Object.values(groups);
     if (sortKey === 'count') rows.sort((a, b) => sortDir === 'asc' ? a.count - b.count : b.count - a.count);
-    else if (sortKey) rows.sort((a, b) => { const av = (a[sortKey] || '').toLowerCase(); const bv = (b[sortKey] || '').toLowerCase(); return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av); });
+    else if (sortKey) rows.sort((a, b) => { const av = (a[sortKey] || '').toString().toLowerCase(); const bv = (b[sortKey] || '').toString().toLowerCase(); return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av); });
     else rows.sort((a, b) => b.count - a.count);
     return rows;
   }, [filtered, grouped, sortKey, sortDir]);
 
   const displayData = grouped ? groupedData : filtered;
-  const activeColumns = grouped ? groupedColumns : flatColumns;
+  const activeColumns = active.columns;
   const activeFilterCount = Object.keys(filters).length;
+
+  // Helper for client-side CSV in current UI order
+  const buildCsv = (rows, cols) => {
+    const esc = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+    const headers = cols.map(c => c.label).map(esc).join(',');
+    const body = rows.map(r => cols.map(col => esc(r[col.key] ?? '')).join(','));
+    return [headers, ...body].join('\n');
+  };
 
   const downloadCSV = async () => {
     if (!runId) return;
     try {
-      const resp = await api.get(`/runs/${runId}/download/contacts`, { responseType: 'blob' });
+      // Request via backend using current UI column order (CSI + any reorder respected)
+      const fields = activeColumns.filter(c => c.key !== 'count').map(c => c.key);
+      const resp = await api.post('/contacts/download', { fields, run_id: runId }, { responseType: 'blob' });
       const blob = new Blob([resp.data], { type: 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a'); a.href = url; a.download = `contacts_${runId.slice(0, 8)}.csv`;
@@ -103,10 +120,7 @@ export default function ContactsTable({ contacts, runId }) {
 
   const downloadGroupedCSV = () => {
     if (!groupedData?.length) return;
-    const headers = ['Sub-Contractor', 'Bid By', 'Count', 'Contractor', 'Quote Amount', 'First Name', 'Last Name', 'Email', 'Phone', 'City', 'State', 'Customer Contact', 'Customer Business', 'Customer Address'];
-    const esc = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
-    const rows = groupedData.map(c => [c.sub_contractor, c.bid_by, c.count, c.contractor, c.quote_amount, c.first_name, c.last_name, c.email, c.phone, c.city, c.state, c.customer_contact_name, c.customer_business, c.customer_address].map(esc).join(','));
-    const csv = [headers.join(','), ...rows].join('\n');
+    const csv = buildCsv(groupedData, activeColumns);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = `contacts_grouped_${runId ? runId.slice(0, 8) : 'export'}.csv`;
@@ -139,6 +153,11 @@ export default function ContactsTable({ contacts, runId }) {
               Clear {activeFilterCount} filter{activeFilterCount > 1 ? 's' : ''}
             </button>
           )}
+          <button onClick={active.resetOrder} title="Reset column order"
+            className="text-xs text-slate-500 hover:text-slate-300 transition-colors inline-flex items-center gap-1 whitespace-nowrap"
+            data-testid="reset-column-order">
+            <RotateCcw className="h-3 w-3" /> Reset cols
+          </button>
         </div>
         <div className="flex items-center gap-3">
           <span className="text-xs text-slate-500">
@@ -164,18 +183,24 @@ export default function ContactsTable({ contacts, runId }) {
           <Table>
             <TableHeader>
               <TableRow className="border-slate-800 hover:bg-transparent">
-                {activeColumns.map(col => (
-                  <TableHead key={col.key}
-                    className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3 whitespace-nowrap">
-                    <span className="inline-flex items-center gap-1">
-                      <span className="cursor-pointer hover:text-slate-200 transition-colors" onClick={() => handleSort(col.key)}>
-                        {col.label}
-                        <ArrowUpDown className={`inline h-3 w-3 ml-0.5 ${sortKey === col.key ? 'text-sky-400' : 'text-slate-600'}`} />
+                {activeColumns.map((col, idx) => {
+                  const dragProps = active.getDragProps(col, idx);
+                  const isDragOver = active.dragOverKey === col.key;
+                  return (
+                    <TableHead key={col.key} {...dragProps}
+                      className={`bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3 whitespace-nowrap transition-colors ${isDragOver ? 'bg-sky-500/10 border-l-2 border-sky-400' : ''}`}
+                      data-testid={`col-header-${col.key}`}>
+                      <span className="inline-flex items-center gap-1">
+                        <GripVertical className="h-3 w-3 text-slate-700 cursor-grab active:cursor-grabbing" />
+                        <span className="cursor-pointer hover:text-slate-200 transition-colors" onClick={() => handleSort(col.key)}>
+                          {col.label}
+                          <ArrowUpDown className={`inline h-3 w-3 ml-0.5 ${sortKey === col.key ? 'text-sky-400' : 'text-slate-600'}`} />
+                        </span>
+                        {col.key !== 'count' && <ColumnFilter columnKey={col.key} data={contacts} filters={filters} setFilters={setFilters} />}
                       </span>
-                      {col.key !== 'count' && <ColumnFilter columnKey={col.key} data={contacts} filters={filters} setFilters={setFilters} />}
-                    </span>
-                  </TableHead>
-                ))}
+                    </TableHead>
+                  );
+                })}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -185,6 +210,8 @@ export default function ContactsTable({ contacts, runId }) {
                     <TableCell key={col.key} className="py-2 px-3 whitespace-nowrap">
                       {col.key === 'count' ? (
                         <span className={`inline-flex items-center justify-center min-w-[28px] rounded-sm px-2 py-0.5 text-xs font-semibold ${c.count > 1 ? 'bg-purple-500/15 text-purple-300 border border-purple-500/20' : 'text-slate-500'}`}>{c.count}</span>
+                      ) : col.key === 'csi' ? (
+                        c[col.key] ? <span className="font-mono text-xs text-sky-300">{c[col.key]}</span> : <span className="text-slate-600">-</span>
                       ) : col.key === 'quote_amount' ? (
                         c[col.key] ? <span className="font-mono text-xs text-emerald-400">{c[col.key]}</span> : <span className="text-slate-600">-</span>
                       ) : col.key === 'email' || col.key === 'phone' ? (

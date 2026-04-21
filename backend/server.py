@@ -457,6 +457,21 @@ MODEL_MAP = {
     "gpt-4o": ("openai", "gpt-4o"),
 }
 
+CSI_REGEX = re.compile(r'^\s*(\d+)')
+
+def extract_csi_from_filename(filename: str) -> str:
+    """Extract leading numeric prefix (CSI code) from a filename.
+    Examples:
+      '03. KHC - includes storm.pdf' -> '03'
+      '12 Smith Quote.docx'          -> '12'
+      'Quote.pdf'                     -> ''
+    """
+    if not filename:
+        return ""
+    base = filename.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+    m = CSI_REGEX.match(base)
+    return m.group(1) if m else ""
+
 def get_api_key_for_model(ai_model: str, admin_config: dict) -> str:
     if ai_model.startswith("claude"):
         custom_key = admin_config.get("claude_api_key", "")
@@ -1222,6 +1237,7 @@ async def process_run(run_id: str, user_id: str):
                     if missing and len(missing) >= 4:
                         errors_out.append({"filename": filename, "reason": "Incomplete Gemini extraction - most fields missing", "missing_fields": ", ".join(missing)})
                     contact["source_filename"] = filename
+                    contact["csi"] = extract_csi_from_filename(filename)
                     contacts_out.append(contact)
 
                 return contacts_out, errors_out, bool(errors_out and not contacts_out)
@@ -1622,6 +1638,7 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     for r in runs:
         run_dates[r["id"]] = r.get("created_at", "")
     field_map = {
+        "csi": "CSI",
         "city": "City", "state": "State", "quote_amount": "Quote Amount",
         "bid_by": "Bid By", "contractor": "Contractor", "sub_contractor": "Sub-Contractor",
         "customer_contact_name": "Customer Contact", "customer_business": "Customer Business",
@@ -1636,6 +1653,9 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     writer.writerow(headers)
     for c in contacts:
         c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
+        # Backfill csi for older records that predate the field
+        if not c.get("csi") and c.get("source_filename"):
+            c["csi"] = extract_csi_from_filename(c.get("source_filename", ""))
         row = [c.get(f, "") for f in input.fields]
         writer.writerow(row)
     output.seek(0)
