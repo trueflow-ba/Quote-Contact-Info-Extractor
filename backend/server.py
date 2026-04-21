@@ -457,20 +457,37 @@ MODEL_MAP = {
     "gpt-4o": ("openai", "gpt-4o"),
 }
 
-CSI_REGEX = re.compile(r'^\s*(\d+)')
+CSI_REGEX = re.compile(r'^\s*(\d{2})(?!\d)')
 
 def extract_csi_from_filename(filename: str) -> str:
-    """Extract leading numeric prefix (CSI code) from a filename.
+    """Extract CSI code from a filename.
+    Rules:
+      - Must be exactly 2 digits at the very start of the basename (optional leading whitespace).
+      - The digits must NOT be followed by another digit (so "003" or "125" do not match).
+      - The numeric value must be in range 00-16 (inclusive); otherwise return "".
     Examples:
       '03. KHC - includes storm.pdf' -> '03'
-      '12 Smith Quote.docx'          -> '12'
+      '00 intro.docx'                 -> '00'
+      '16-final.pdf'                  -> '16'
+      '17. out of range.pdf'          -> ''
+      '7 only one digit.pdf'          -> ''
+      '001-three digits.pdf'          -> ''
       'Quote.pdf'                     -> ''
     """
     if not filename:
         return ""
     base = filename.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
     m = CSI_REGEX.match(base)
-    return m.group(1) if m else ""
+    if not m:
+        return ""
+    two = m.group(1)
+    try:
+        n = int(two)
+    except ValueError:
+        return ""
+    if 0 <= n <= 16:
+        return two
+    return ""
 
 def get_api_key_for_model(ai_model: str, admin_config: dict) -> str:
     if ai_model.startswith("claude"):
@@ -1539,6 +1556,9 @@ async def get_run_contacts(run_id: str, request: Request):
         contacts = await db.raw_contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
     else:
         contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
+    # Backfill CSI for older records that predate the field (or for records with stale values)
+    for c in contacts:
+        c["csi"] = extract_csi_from_filename(c.get("source_filename", ""))
     return contacts
 
 @api_router.get("/runs/{run_id}/errors")
@@ -1591,6 +1611,8 @@ async def get_all_user_contacts(user_id: str):
         run_dates[r["id"]] = r.get("created_at", "")
     for c in contacts:
         c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
+        # Backfill CSI so older records and stale values stay consistent with the current rule
+        c["csi"] = extract_csi_from_filename(c.get("source_filename", ""))
     return contacts
 
 @api_router.get("/contacts/all")
@@ -1653,9 +1675,8 @@ async def download_custom_csv(input: CsvExportInput, request: Request):
     writer.writerow(headers)
     for c in contacts:
         c["import_date"] = run_dates.get(c.get("run_id", ""), c.get("created_at", ""))
-        # Backfill csi for older records that predate the field
-        if not c.get("csi") and c.get("source_filename"):
-            c["csi"] = extract_csi_from_filename(c.get("source_filename", ""))
+        # Always recompute CSI from source_filename to apply the latest rule
+        c["csi"] = extract_csi_from_filename(c.get("source_filename", ""))
         row = [c.get(f, "") for f in input.fields]
         writer.writerow(row)
     output.seek(0)
