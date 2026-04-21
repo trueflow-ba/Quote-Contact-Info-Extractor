@@ -1067,6 +1067,32 @@ IMPORTANT RULES:
 
 PRIVACY: After processing this file for the requested analysis, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."""
 
+def _clean_sub_contractor_address(raw: str) -> str:
+    """Strip city/state/zip bleed-through from the sub-contractor address.
+    The prompt instructs Gemini to return street-only, but real models sometimes
+    append city/state/zip anyway. This is a defensive cleanup.
+    Examples:
+      "1234 Main St, Dallas, TX 75201" -> "1234 Main St"
+      "PO Box 4567 Dallas TX 75201"    -> "PO Box 4567"
+      "1234 Main St, Suite 200"        -> "1234 Main St, Suite 200"  (kept as-is)
+    """
+    if not raw:
+        return ""
+    s = raw.strip().rstrip('.,;')
+    # Remove trailing "City, ST 12345" or "City, ST" or trailing zip
+    # 1) Remove ", City, ST 12345[-6789]"
+    s = re.sub(r',\s*[A-Za-z .\-]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?\s*$', '', s).strip()
+    # 2) Remove ", City, ST" (no zip)
+    s = re.sub(r',\s*[A-Za-z .\-]+,\s*[A-Z]{2}\s*$', '', s).strip()
+    # 2b) Remove ", City ST" (no comma before state, no zip)
+    s = re.sub(r',\s*[A-Za-z .\-]+\s+[A-Z]{2}\s*$', '', s).strip()
+    # 3) Remove trailing " City ST 12345" with no comma
+    s = re.sub(r'\s+[A-Za-z .\-]+\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$', '', s).strip()
+    # 4) Remove trailing zip alone "... 75201"
+    s = re.sub(r',?\s*\d{5}(?:-\d{4})?\s*$', '', s).strip().rstrip(',')
+    return s.strip()
+
+
 def _parse_gemini_contacts_response(response: str, filename: str):
     """Parse Gemini JSON response into a normalized list of contacts."""
     cleaned = response.strip()
@@ -1080,6 +1106,15 @@ def _parse_gemini_contacts_response(response: str, filename: str):
     for c in contacts:
         if not isinstance(c, dict):
             continue
+        # Accept multiple possible keys for sub-contractor address
+        addr_raw = (c.get("address")
+                    or c.get("sub_contractor_address")
+                    or c.get("street_address")
+                    or c.get("vendor_address")
+                    or c.get("from_address")
+                    or c.get("sender_address")
+                    or "")
+        addr_clean = _clean_sub_contractor_address(str(addr_raw))
         valid.append({
             "city": str(c.get("city", "")),
             "state": str(c.get("state", "")),
@@ -1090,12 +1125,17 @@ def _parse_gemini_contacts_response(response: str, filename: str):
             "customer_contact_name": str(c.get("customer_contact_name", "")),
             "customer_business": str(c.get("customer_business", "")),
             "customer_address": str(c.get("customer_address", "")),
-            "address": str(c.get("address", "")),
+            "address": addr_clean,
             "last_name": str(c.get("last_name", "")),
             "first_name": str(c.get("first_name", "")),
             "email": str(c.get("email", "")),
             "phone": str(c.get("phone", "")),
         })
+    # Diagnostic: log if address is empty but we extracted other contact info
+    # (helps identify if prompt needs further tuning)
+    missing_addr = sum(1 for v in valid if not v["address"] and (v["email"] or v["phone"]))
+    if missing_addr:
+        logger.warning(f"Address missing for {missing_addr}/{len(valid)} contacts from {filename}. Raw keys in response: {list(contacts[0].keys()) if contacts and isinstance(contacts[0], dict) else 'none'}")
     return valid
 
 
@@ -1710,9 +1750,24 @@ async def download_contacts_csv(run_id: str, request: Request):
         contacts = await db.contacts.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).to_list(10000)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["City", "State", "Quote Amount", "Bid By", "Contractor", "Sub-Contractor", "Customer Contact", "Customer Business", "Customer Address", "Last Name", "First Name", "Email", "Phone", "Source File"])
+    writer.writerow([
+        "CSI", "Sub-Contractor", "Bid By", "First Name", "Last Name",
+        "Email", "Phone", "Address", "City", "State",
+        "Contractor", "Quote Amount", "Source File",
+        "Customer Contact", "Customer Business", "Customer Address",
+    ])
     for c in contacts:
-        writer.writerow([c.get("city",""), c.get("state",""), c.get("quote_amount",""), c.get("bid_by",""), c.get("contractor",""), c.get("sub_contractor",""), c.get("customer_contact_name",""), c.get("customer_business",""), c.get("customer_address",""), c.get("last_name",""), c.get("first_name",""), c.get("email",""), c.get("phone",""), c.get("source_filename","")])
+        csi_val = extract_csi_from_filename(c.get("source_filename", ""))
+        writer.writerow([
+            csi_val,
+            c.get("sub_contractor", ""), c.get("bid_by", ""),
+            c.get("first_name", ""), c.get("last_name", ""),
+            c.get("email", ""), c.get("phone", ""),
+            c.get("address", ""), c.get("city", ""), c.get("state", ""),
+            c.get("contractor", ""), c.get("quote_amount", ""),
+            c.get("source_filename", ""),
+            c.get("customer_contact_name", ""), c.get("customer_business", ""), c.get("customer_address", ""),
+        ])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
