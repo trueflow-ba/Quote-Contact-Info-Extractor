@@ -517,7 +517,8 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     pdf_buffers = []  # list of (filename, bytes)
     rejected_files = []
 
-    SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls')
+    SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls',
+                            '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp')
 
     for file in files:
         data = await file.read()
@@ -540,7 +541,7 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
                 continue
             pdf_buffers.append((file.filename, data))
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Accepted: PDF, DOCX, XLSX, and ZIP files.")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Accepted: PDF, DOCX, XLSX, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
 
     if not pdf_buffers:
         raise HTTPException(status_code=400, detail="No supported files found in upload")
@@ -573,7 +574,9 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
             for idx, (filename, pdf_data) in enumerate(pdf_buffers):
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
                 ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                          'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel'}
+                          'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
+                          'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp',
+                          'heic': 'image/heic', 'heif': 'image/heif', 'tiff': 'image/tiff', 'tif': 'image/tiff', 'bmp': 'image/bmp'}
                 content_type = ct_map.get(ext, 'application/octet-stream')
                 storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.{ext}"
                 try:
@@ -1288,10 +1291,29 @@ async def process_run(run_id: str, user_id: str):
                         elif gemini_error is None:
                             gemini_error = conv_err or "LibreOffice conversion failed"
                 else:
-                    # PDF path (default)
-                    if len(file_bytes) > PDF_SIZE_THRESHOLD:
-                        file_bytes = compress_pdf(file_bytes, filename)
-                    contacts, gemini_error = await extract_contacts_with_gemini(file_bytes, filename, gemini_key)
+                    # PDF path (default) + any other unknown extensions fall through to PDF pipeline
+                    is_image = ext in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'tiff', 'tif', 'bmp')
+                    if is_image:
+                        try:
+                            from PIL import Image
+                            # Pillow needs pillow-heif for HEIC support (register opener if available)
+                            if ext in ('heic', 'heif'):
+                                try:
+                                    from pillow_heif import register_heif_opener
+                                    register_heif_opener()
+                                except ImportError:
+                                    pass
+                            img = Image.open(io.BytesIO(file_bytes))
+                            if img.mode not in ('RGB', 'L'):
+                                img = img.convert('RGB')
+                            contacts, gemini_error = await extract_contacts_with_gemini_from_images([img], filename, gemini_key)
+                        except Exception as img_err:
+                            logger.error(f"Image load failed for {filename}: {img_err}")
+                            contacts, gemini_error = [], f"Could not load image: {img_err}"
+                    else:
+                        if len(file_bytes) > PDF_SIZE_THRESHOLD:
+                            file_bytes = compress_pdf(file_bytes, filename)
+                        contacts, gemini_error = await extract_contacts_with_gemini(file_bytes, filename, gemini_key)
 
                 if gemini_error and not contacts:
                     errors_out.append({"filename": filename, "reason": f"Gemini extraction failed: {gemini_error}", "missing_fields": "All fields"})
