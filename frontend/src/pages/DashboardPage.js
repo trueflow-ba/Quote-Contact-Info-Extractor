@@ -11,6 +11,7 @@ import ErrorsTable from '@/components/ErrorsTable';
 import DuplicatesTable from '@/components/DuplicatesTable';
 import AllContactsTable from '@/components/AllContactsTable';
 import RunHistory from '@/components/RunHistory';
+import MasterIndexTab from '@/components/MasterIndexTab';
 import DataViz from '@/components/DataViz';
 
 export default function DashboardPage() {
@@ -350,12 +351,16 @@ export default function DashboardPage() {
             <TabsTrigger value="history" className="text-sm data-[state=active]:bg-slate-700/50 data-[state=active]:text-slate-200 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5" data-testid="tab-history">
               Run History {runs.length > 0 && `(${runs.length})`}
             </TabsTrigger>
+            <TabsTrigger value="master" className="text-sm data-[state=active]:bg-cyan-500/10 data-[state=active]:text-cyan-300 data-[state=active]:shadow-none text-slate-400 rounded-sm px-4 py-1.5" data-testid="tab-master-index">
+              Master Index
+            </TabsTrigger>
           </TabsList>
           <TabsContent value="all" className="mt-4 animate-fade-in"><AllContactsTable /></TabsContent>
           <TabsContent value="results" className="mt-4 animate-fade-in"><ContactsTable contacts={contacts} runId={currentRunId} runStats={currentRun?.stats} duplicatesCount={duplicates.length} errorsCount={errors.length} /></TabsContent>
           <TabsContent value="duplicates" className="mt-4 animate-fade-in"><DuplicatesTable duplicates={duplicates} /></TabsContent>
           <TabsContent value="issues" className="mt-4 animate-fade-in"><ErrorsTable errors={errors} runId={currentRunId} /></TabsContent>
           <TabsContent value="history" className="mt-4 animate-fade-in"><RunHistory runs={runs} onSelectRun={selectRun} onDeleteRun={deleteRun} onRetryRun={retryRun} currentRunId={currentRunId} /></TabsContent>
+          <TabsContent value="master" className="mt-4 animate-fade-in"><MasterIndexTab /></TabsContent>
         </Tabs>
       </main>
     </div>

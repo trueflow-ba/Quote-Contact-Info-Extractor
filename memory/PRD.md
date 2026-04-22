@@ -60,6 +60,7 @@ Build a construction-industry contact extraction portal. Users upload PDFs/ZIPs 
 - **Skip Registry export/import**: portable CSV preserves dedup state across container rebuilds.
 - **Per-run Excel processing log** with 3-run retention.
 - **Accounting summary bars**: "This Run" and "All Contacts" tabs now show a summary row (Files uploaded / Contacts / Duplicates / Issues / No contacts found) and cross-run totals via new `/api/stats/all` endpoint.
+- **Master Index tab**: upload CSV/XLSX with a `FileName` column; compares against Skip Registry + run history and reports status per file (`Processed`, `Processed (no contacts)`, `Error`, `Pending`, `Not Uploaded`). Summary cards + file-type breakdown + searchable table + downloadable comparison CSV. Endpoints: `POST /api/master-index/upload`, `GET /api/master-index`, `GET /api/master-index/download`, `DELETE /api/master-index`.
 
 ## Prioritized Backlog
 - **P1**: Password reset flow.

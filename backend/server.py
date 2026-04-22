@@ -2629,6 +2629,278 @@ async def import_skip_registry(request: Request, file: UploadFile = File(...)):
     return {"imported": imported, "skipped_already_known": skipped, "total_in_file": imported + skipped}
 
 # =============================================================================
+# MASTER INDEX — user uploads a CSV/XLSX with a FileName column; app compares
+# against the files/contacts/errors collections to report which files have
+# been processed vs. still need processing. Stored per-user (replace on re-upload).
+# =============================================================================
+def _parse_master_index(filename: str, data: bytes) -> List[str]:
+    """Return a list of filenames parsed from a CSV or XLSX. Column 'FileName'
+    (case-insensitive) preferred; if no header or a single-column sheet, the
+    first column is used. Filenames are kept case-sensitive as stored."""
+    lower = (filename or "").lower()
+    names: List[str] = []
+    if lower.endswith(".xlsx"):
+        from openpyxl import load_workbook
+        try:
+            wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Unreadable XLSX: {e}")
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+        # Detect header row
+        header_idx = None
+        for i, r in enumerate(rows[:1]):
+            for c in r:
+                if isinstance(c, str) and c.strip().lower() in ("filename", "file name", "file_name"):
+                    header_idx = i
+                    break
+            if header_idx is not None:
+                break
+        col_idx = 0
+        if header_idx is not None:
+            header_row = rows[header_idx]
+            for j, c in enumerate(header_row):
+                if isinstance(c, str) and c.strip().lower() in ("filename", "file name", "file_name"):
+                    col_idx = j
+                    break
+            data_rows = rows[header_idx + 1:]
+        else:
+            data_rows = rows
+        for r in data_rows:
+            if col_idx < len(r) and r[col_idx] is not None:
+                s = str(r[col_idx]).strip()
+                if s:
+                    names.append(s)
+    elif lower.endswith(".csv"):
+        try:
+            text = data.decode("utf-8-sig", errors="replace")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unreadable CSV")
+        # Try DictReader first — matches header 'FileName'/'filename'/'file name'/...
+        reader = csv.reader(io.StringIO(text))
+        all_rows = [r for r in reader if any((c or "").strip() for c in r)]
+        if not all_rows:
+            return []
+        header = all_rows[0]
+        col_idx = 0
+        has_header = False
+        for j, c in enumerate(header):
+            if (c or "").strip().lower() in ("filename", "file name", "file_name"):
+                col_idx = j
+                has_header = True
+                break
+        data_rows = all_rows[1:] if has_header else all_rows
+        for r in data_rows:
+            if col_idx < len(r):
+                s = (r[col_idx] or "").strip()
+                if s:
+                    names.append(s)
+    else:
+        raise HTTPException(status_code=400, detail="Expected a .csv or .xlsx file")
+    return names
+
+
+def _file_ext(fname: str) -> str:
+    if not fname:
+        return "(none)"
+    i = fname.rfind(".")
+    return fname[i:].lower() if i >= 0 else "(none)"
+
+
+@api_router.post("/master-index/upload")
+async def upload_master_index(request: Request, file: UploadFile = File(...)):
+    """Upload a master index (CSV or XLSX, column 'FileName')."""
+    user = await get_current_user(request)
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    names = _parse_master_index(file.filename or "", data)
+    if not names:
+        raise HTTPException(status_code=400, detail="No filenames found. Ensure the file has a 'FileName' column or a single column of filenames.")
+    # Preserve order & dedupe case-sensitively
+    seen = set()
+    unique = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    doc = {
+        "user_id": user["_id"],
+        "original_filename": file.filename or "master_index",
+        "entries": unique,
+        "total": len(unique),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.master_index.replace_one({"user_id": user["_id"]}, doc, upsert=True)
+    return {"total": len(unique), "original_filename": doc["original_filename"], "uploaded_at": doc["uploaded_at"]}
+
+
+async def _compare_master_index(user_id: str):
+    """Compare the stored master index against files/contacts/errors.
+    Returns (summary, results list).
+    Status values:
+      - "Processed"             — file exists AND produced >=1 contact
+      - "Processed (no contacts)" — file exists, run completed, no contacts/errors
+      - "Error"                 — file exists AND has a processing error
+      - "Pending"               — file uploaded but run not yet completed
+      - "Not Uploaded"          — filename never seen
+    """
+    master = await db.master_index.find_one({"user_id": user_id}, {"_id": 0})
+    if not master:
+        return None, None
+    entries = master.get("entries", [])
+    if not entries:
+        return master, []
+
+    # Build a lookup: filename -> {has_file, latest_run_id, size, processed_at, contacts_count, has_error}
+    # Case-sensitive exact match.
+    lookups: dict = {name: {"has_file": False, "run_id": "", "size": 0, "processed_at": "", "contacts_count": 0, "has_error": False, "run_status": ""} for name in entries}
+
+    # Files collection — keep most recent per filename
+    async for f in db.files.find(
+        {"user_id": user_id, "original_filename": {"$in": entries}},
+        {"_id": 0, "original_filename": 1, "run_id": 1, "size": 1, "created_at": 1}
+    ):
+        nm = f.get("original_filename", "")
+        row = lookups.get(nm)
+        if row is not None:
+            row["has_file"] = True
+            if f.get("created_at", "") > row["processed_at"]:
+                row["processed_at"] = f.get("created_at", "")
+                row["run_id"] = f.get("run_id", "")
+                row["size"] = f.get("size", 0)
+
+    # Fetch statuses of the involved runs
+    involved_run_ids = {r["run_id"] for r in lookups.values() if r["run_id"]}
+    if involved_run_ids:
+        async for r in db.runs.find(
+            {"user_id": user_id, "id": {"$in": list(involved_run_ids)}},
+            {"_id": 0, "id": 1, "status": 1}
+        ):
+            for info in lookups.values():
+                if info["run_id"] == r.get("id"):
+                    info["run_status"] = r.get("status", "")
+
+    # Contacts counts per filename
+    agg = db.contacts.aggregate([
+        {"$match": {"user_id": user_id, "source_filename": {"$in": entries}}},
+        {"$group": {"_id": "$source_filename", "n": {"$sum": 1}}},
+    ])
+    async for row in agg:
+        nm = row.get("_id", "")
+        if nm in lookups:
+            lookups[nm]["contacts_count"] = row.get("n", 0)
+
+    # Errors — processing_errors stores filename under `filename`
+    err_names_cursor = db.processing_errors.find(
+        {"user_id": user_id, "filename": {"$in": entries}},
+        {"_id": 0, "filename": 1}
+    )
+    async for e in err_names_cursor:
+        nm = e.get("filename", "")
+        if nm in lookups:
+            lookups[nm]["has_error"] = True
+
+    # Build results preserving master-list order
+    results = []
+    summary = {"total": len(entries), "processed": 0, "processed_no_contacts": 0, "errored": 0, "pending": 0, "not_uploaded": 0}
+    by_type: dict = {}
+    run_completed_statuses = {"completed", "cancelled"}
+
+    for nm in entries:
+        info = lookups[nm]
+        if not info["has_file"]:
+            status = "Not Uploaded"
+            summary["not_uploaded"] += 1
+        elif info["contacts_count"] > 0:
+            status = "Processed"
+            summary["processed"] += 1
+        elif info["has_error"]:
+            status = "Error"
+            summary["errored"] += 1
+        elif info["run_status"] in run_completed_statuses:
+            status = "Processed (no contacts)"
+            summary["processed_no_contacts"] += 1
+        else:
+            status = "Pending"
+            summary["pending"] += 1
+
+        ext = _file_ext(nm)
+        if ext not in by_type:
+            by_type[ext] = {"total": 0, "processed": 0, "processed_no_contacts": 0, "errored": 0, "pending": 0, "not_uploaded": 0}
+        by_type[ext]["total"] += 1
+        key = {
+            "Processed": "processed",
+            "Processed (no contacts)": "processed_no_contacts",
+            "Error": "errored",
+            "Pending": "pending",
+            "Not Uploaded": "not_uploaded",
+        }[status]
+        by_type[ext][key] += 1
+
+        results.append({
+            "filename": nm,
+            "extension": ext,
+            "status": status,
+            "run_id": info["run_id"],
+            "size": info["size"],
+            "processed_at": info["processed_at"],
+            "contacts_count": info["contacts_count"],
+        })
+
+    summary["by_type"] = [
+        {"extension": k, **v} for k, v in sorted(by_type.items(), key=lambda x: -x[1]["total"])
+    ]
+    return master, {"summary": summary, "results": results}
+
+
+@api_router.get("/master-index")
+async def get_master_index(request: Request):
+    """Return the master index metadata + comparison results. Null if none uploaded."""
+    user = await get_current_user(request)
+    master, comparison = await _compare_master_index(user["_id"])
+    if not master:
+        return {"master": None, "comparison": None}
+    return {
+        "master": {
+            "original_filename": master.get("original_filename", ""),
+            "total": master.get("total", 0),
+            "uploaded_at": master.get("uploaded_at", ""),
+        },
+        "comparison": comparison,
+    }
+
+
+@api_router.get("/master-index/download")
+async def download_master_index_comparison(request: Request):
+    """Download the comparison results as a CSV."""
+    user = await get_current_user(request)
+    master, comparison = await _compare_master_index(user["_id"])
+    if not master or not comparison:
+        raise HTTPException(status_code=404, detail="No master index uploaded")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["FileName", "Extension", "Status", "Contacts Extracted", "Run ID", "Size", "Processed At"])
+    for r in comparison["results"]:
+        writer.writerow([r["filename"], r["extension"], r["status"], r["contacts_count"], r["run_id"], r["size"], r["processed_at"]])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=master_index_comparison_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"}
+    )
+
+
+@api_router.delete("/master-index")
+async def delete_master_index(request: Request):
+    user = await get_current_user(request)
+    await db.master_index.delete_many({"user_id": user["_id"]})
+    return {"message": "Master index cleared"}
+
+
+# =============================================================================
 # DELETE ROUTES
 # =============================================================================
 @api_router.delete("/runs/{run_id}")
@@ -2698,6 +2970,7 @@ async def startup():
     await db.files.create_index([("user_id", 1), ("original_filename", 1), ("size", 1)])
     await db.duplicates.create_index("run_id")
     await db.raw_contacts.create_index("run_id")
+    await db.master_index.create_index("user_id", unique=True)
     # Recover stale "processing" runs from server restarts
     stale = await db.runs.count_documents({"status": "processing"})
     if stale > 0:
