@@ -57,6 +57,7 @@ export default function AllContactsTable() {
   const [grouped, setGrouped] = useState(false);
   const [filters, setFilters] = useState({});
   const [showExport, setShowExport] = useState(false);
+  const [allStats, setAllStats] = useState(null);
 
   const flatOrder = useColumnOrder(ALL_FIELDS, 'all-contacts-flat-cols-v3');
   const groupedOrder = useColumnOrder(GROUPED_COLUMNS, 'all-contacts-grouped-cols-v3');
@@ -79,7 +80,11 @@ export default function AllContactsTable() {
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
-    try { const { data } = await api.get('/contacts/all'); setContacts(data); } catch {}
+    try {
+      const [c, s] = await Promise.all([api.get('/contacts/all'), api.get('/stats/all')]);
+      setContacts(c.data);
+      setAllStats(s.data);
+    } catch {}
     setLoading(false);
   }, []);
 
@@ -166,10 +171,55 @@ export default function AllContactsTable() {
 
   if (loading) return <div className="flex items-center justify-center py-16" data-testid="all-contacts-loading"><Loader2 className="h-5 w-5 text-sky-500 animate-spin" /></div>;
 
-  if (!contacts.length) return <div className="text-center py-16 text-slate-500 text-sm" data-testid="all-contacts-empty">No contacts across any runs yet. Upload PDFs and extract contacts to build your master list.</div>;
+  const totalFiles = allStats?.total_unique_files ?? 0;
+  const totalContacts = allStats?.total_contacts ?? 0;
+  const totalDupes = allStats?.total_duplicates ?? 0;
+  const totalErrors = allStats?.total_errors ?? 0;
+  const totalRuns = allStats?.total_runs ?? 0;
+  const accountedFor = totalContacts + totalDupes + totalErrors;
+  const totalFiltered = Math.max(0, totalFiles - accountedFor);
+
+  const AccountingBar = () => (
+    totalFiles > 0 ? (
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 mb-3 px-3 py-2 bg-[#111827]/60 border border-slate-800 rounded-sm text-xs" data-testid="all-accounting-summary">
+        <span className="text-slate-400">
+          <span className="text-slate-500">Total unique files uploaded:</span>{' '}
+          <span className="text-slate-100 font-semibold font-mono" data-testid="all-files-uploaded">{totalFiles}</span>
+          <span className="text-slate-600 ml-1.5">across {totalRuns} run{totalRuns !== 1 ? 's' : ''}</span>
+        </span>
+        <span className="text-slate-700">|</span>
+        <span className="text-emerald-400">
+          Contacts: <span className="font-semibold font-mono" data-testid="all-contacts-count">{totalContacts}</span>
+        </span>
+        <span className="text-purple-400">
+          Duplicates: <span className="font-semibold font-mono" data-testid="all-duplicates-count">{totalDupes}</span>
+        </span>
+        <span className="text-amber-400">
+          Issues: <span className="font-semibold font-mono" data-testid="all-errors-count">{totalErrors}</span>
+        </span>
+        {totalFiltered > 0 && (
+          <span className="text-slate-500" title="Files with no extractable contact info after processing (empty pages, internal domains, unreadable scans, etc.)">
+            No contacts found: <span className="font-semibold font-mono" data-testid="all-filtered-count">{totalFiltered}</span>
+          </span>
+        )}
+      </div>
+    ) : null
+  );
+
+  if (!contacts.length) return (
+    <div data-testid="all-contacts-table-container">
+      <AccountingBar />
+      <div className="text-center py-16 text-slate-500 text-sm" data-testid="all-contacts-empty">
+        {totalFiles > 0
+          ? 'No contacts extracted across any runs yet. All uploaded files resulted in duplicates, issues, or had no extractable contact info.'
+          : 'No contacts across any runs yet. Upload PDFs and extract contacts to build your master list.'}
+      </div>
+    </div>
+  );
 
   return (
     <div data-testid="all-contacts-table-container">
+      <AccountingBar />
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
         <div className="flex items-center gap-3">
           <div className="relative w-full sm:w-64">

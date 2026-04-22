@@ -51,14 +51,23 @@ Build a construction-industry contact extraction portal. Users upload PDFs/ZIPs 
 - **UI-order CSV exports**: per-run Download CSV now routes through `/contacts/download` using current column order. All Contacts "Export CSV" dialog lists fields in UI order and sends them in that order.
 - **ColumnFilter enhancements**: dropdown now has a search bar to narrow values, plus a "Select all / Clear all" checkbox (works on visible/filtered values). "Reset filter" preserved. No existing functionality removed.
 
+### Apr 22, 2026
+- **Large-run safety controls**: exponential backoff for Gemini 429s, circuit-breaker auto-pause on N consecutive failures, budget-ceiling guard (USD), admin UI thresholds.
+- **LibreOffice hardening**: process-group SIGKILL on timeout, zombie sweep.
+- **Chunked uploads**: frontend/backend support 25 MB chunks for files > 200 MB (bypasses ingress limit).
+- **Pause/Resume state-machine race fix**: pause/resume now idempotent.
+- **SHA-256 content dedup**: identical file bytes skip LLM entirely (cross-run).
+- **Skip Registry export/import**: portable CSV preserves dedup state across container rebuilds.
+- **Per-run Excel processing log** with 3-run retention.
+- **Accounting summary bars**: "This Run" and "All Contacts" tabs now show a summary row (Files uploaded / Contacts / Duplicates / Issues / No contacts found) and cross-run totals via new `/api/stats/all` endpoint.
+
 ## Prioritized Backlog
-- **P1**: Harden LibreOffice subprocess (timeout kill + zombie cleanup on high load).
 - **P1**: Password reset flow.
-- **P1**: Pre-run Emergent LLM key budget check + rate-limit backoff (for 10k+ runs).
 - **P2**: Pagination for "All Contacts" table (10k+ rows).
 - **P2**: Bulk operations on contacts (multi-select delete).
 - **P2**: Advanced filtering (date range, field-level).
 - **P2**: GPT-4o-mini failover on Gemini 429.
+- **P2**: Optional support for .msg / .html / .rtf / .odt / .eml.
 - **P3**: Admin user management (invite users).
 - **P3**: Export history as spreadsheet.
 

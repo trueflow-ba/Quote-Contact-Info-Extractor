@@ -352,7 +352,7 @@ export default function DashboardPage() {
             </TabsTrigger>
           </TabsList>
           <TabsContent value="all" className="mt-4 animate-fade-in"><AllContactsTable /></TabsContent>
-          <TabsContent value="results" className="mt-4 animate-fade-in"><ContactsTable contacts={contacts} runId={currentRunId} /></TabsContent>
+          <TabsContent value="results" className="mt-4 animate-fade-in"><ContactsTable contacts={contacts} runId={currentRunId} runStats={currentRun?.stats} duplicatesCount={duplicates.length} errorsCount={errors.length} /></TabsContent>
           <TabsContent value="duplicates" className="mt-4 animate-fade-in"><DuplicatesTable duplicates={duplicates} /></TabsContent>
           <TabsContent value="issues" className="mt-4 animate-fade-in"><ErrorsTable errors={errors} runId={currentRunId} /></TabsContent>
           <TabsContent value="history" className="mt-4 animate-fade-in"><RunHistory runs={runs} onSelectRun={selectRun} onDeleteRun={deleteRun} onRetryRun={retryRun} currentRunId={currentRunId} /></TabsContent>

@@ -45,7 +45,7 @@ const GROUPED_COLUMNS = [
   { key: 'customer_address', label: 'Customer Address' },
 ];
 
-export default function ContactsTable({ contacts, runId }) {
+export default function ContactsTable({ contacts, runId, runStats, duplicatesCount = 0, errorsCount = 0 }) {
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState('');
   const [sortDir, setSortDir] = useState('asc');
@@ -135,8 +135,37 @@ export default function ContactsTable({ contacts, runId }) {
     return <div className="text-center py-16 text-slate-500 text-sm" data-testid="contacts-empty">No contacts extracted yet. Upload PDFs and run extraction.</div>;
   }
 
+  const filesUploaded = runStats?.total_pdfs ?? 0;
+  const contactsExtracted = contacts?.length ?? 0;
+  const accountedFor = contactsExtracted + duplicatesCount + errorsCount;
+  const filtered_out = Math.max(0, filesUploaded - accountedFor);
+
   return (
     <div data-testid="contacts-table-container">
+      {/* Run accounting summary — shows how files uploaded split across tabs */}
+      {filesUploaded > 0 && (
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 mb-3 px-3 py-2 bg-[#111827]/60 border border-slate-800 rounded-sm text-xs" data-testid="run-accounting-summary">
+          <span className="text-slate-400">
+            <span className="text-slate-500">Files uploaded this run:</span>{' '}
+            <span className="text-slate-100 font-semibold font-mono" data-testid="run-files-uploaded">{filesUploaded}</span>
+          </span>
+          <span className="text-slate-700">|</span>
+          <span className="text-sky-400">
+            Contacts: <span className="font-semibold font-mono" data-testid="run-contacts-count">{contactsExtracted}</span>
+          </span>
+          <span className="text-purple-400">
+            Duplicates: <span className="font-semibold font-mono" data-testid="run-duplicates-count">{duplicatesCount}</span>
+          </span>
+          <span className="text-amber-400">
+            Issues: <span className="font-semibold font-mono" data-testid="run-errors-count">{errorsCount}</span>
+          </span>
+          {filtered_out > 0 && (
+            <span className="text-slate-500" title="Files with no extractable contact info after processing (empty pages, internal domains, unreadable scans, etc.)">
+              No contacts found: <span className="font-semibold font-mono" data-testid="run-filtered-count">{filtered_out}</span>
+            </span>
+          )}
+        </div>
+      )}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4">
         <div className="flex items-center gap-3">
           <div className="relative w-full sm:w-64">

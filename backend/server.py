@@ -2205,6 +2205,52 @@ async def get_all_contacts(request: Request):
     user = await get_current_user(request)
     return await get_all_user_contacts(user["_id"])
 
+@api_router.get("/stats/all")
+async def get_all_stats(request: Request):
+    """Cross-run accounting so the UI can show:
+    Files uploaded = Contacts + Duplicates + Errors + Filtered.
+
+    - total_unique_files: distinct files ever uploaded (by sha256; legacy rows
+      without a hash are counted once per (filename, size)).
+    - total_contacts / total_duplicates / total_errors: aggregate counts
+      across every run for this user.
+    - total_runs: number of runs recorded.
+    """
+    user = await get_current_user(request)
+    user_id = user["_id"]
+
+    # Distinct unique files via sha256, plus legacy (no-hash) fallback
+    sha_cursor = db.files.aggregate([
+        {"$match": {"user_id": user_id, "sha256": {"$exists": True, "$ne": ""}}},
+        {"$group": {"_id": "$sha256"}},
+        {"$count": "n"},
+    ])
+    legacy_cursor = db.files.aggregate([
+        {"$match": {"user_id": user_id, "$or": [{"sha256": {"$exists": False}}, {"sha256": ""}]}},
+        {"$group": {"_id": {"fn": "$original_filename", "sz": "$size"}}},
+        {"$count": "n"},
+    ])
+    sha_count = 0
+    async for row in sha_cursor:
+        sha_count = row.get("n", 0)
+    legacy_count = 0
+    async for row in legacy_cursor:
+        legacy_count = row.get("n", 0)
+    total_unique_files = sha_count + legacy_count
+
+    total_contacts = await db.contacts.count_documents({"user_id": user_id})
+    total_duplicates = await db.duplicates.count_documents({"user_id": user_id})
+    total_errors = await db.processing_errors.count_documents({"user_id": user_id})
+    total_runs = await db.runs.count_documents({"user_id": user_id})
+
+    return {
+        "total_unique_files": total_unique_files,
+        "total_contacts": total_contacts,
+        "total_duplicates": total_duplicates,
+        "total_errors": total_errors,
+        "total_runs": total_runs,
+    }
+
 @api_router.get("/contacts/all/charts")
 async def get_all_contacts_charts(request: Request):
     user = await get_current_user(request)
