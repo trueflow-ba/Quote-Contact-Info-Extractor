@@ -51,6 +51,9 @@ export default function AdminPage() {
         max_pdfs_per_upload: config.max_pdfs_per_upload,
         storage_max_mb: config.storage_max_mb,
         storage_target_mb: config.storage_target_mb,
+        budget_ceiling_usd: config.budget_ceiling_usd,
+        consecutive_failure_threshold: config.consecutive_failure_threshold,
+        retry_max_attempts: config.retry_max_attempts,
       });
       toast.success('Admin settings saved');
       const { data } = await api.get('/admin/settings');
@@ -178,6 +181,41 @@ export default function AdminPage() {
             <label className="block text-xs text-slate-400 mb-1.5">Max PDFs per upload</label>
             <Input data-testid="max-pdfs-input" type="number" min={1} max={500} value={config.max_pdfs_per_upload}
               onChange={e => setConfig(s => ({ ...s, max_pdfs_per_upload: parseInt(e.target.value) || 50 }))} className="bg-[#0A0F1C] border-slate-800 text-slate-300 w-32 font-mono" />
+          </div>
+        </section>
+
+        {/* Safety Controls (P0 prework) */}
+        <section className="bg-[#111827] border border-slate-800 rounded-sm p-6 space-y-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Shield className="h-4 w-4 text-rose-400" strokeWidth={1.5} />
+            <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider">Large-Run Safety Controls</h2>
+          </div>
+          <p className="text-xs text-slate-500">Applies to ALL runs. The pipeline auto-pauses when any threshold is breached; click Retry on the run to resume.</p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-xs text-slate-400 mb-1.5">Budget ceiling (USD)</label>
+              <Input data-testid="budget-ceiling-input" type="number" min={1} max={10000} step={1}
+                value={config.budget_ceiling_usd ?? 100}
+                onChange={e => setConfig(s => ({ ...s, budget_ceiling_usd: parseFloat(e.target.value) || 100 }))}
+                className="bg-[#0A0F1C] border-slate-800 text-slate-300 font-mono" />
+              <p className="text-[10px] text-slate-600 mt-1">Auto-pause when approximate cost reaches this amount</p>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1.5">Consecutive failure threshold</label>
+              <Input data-testid="failure-threshold-input" type="number" min={3} max={200}
+                value={config.consecutive_failure_threshold ?? 10}
+                onChange={e => setConfig(s => ({ ...s, consecutive_failure_threshold: parseInt(e.target.value) || 10 }))}
+                className="bg-[#0A0F1C] border-slate-800 text-slate-300 font-mono" />
+              <p className="text-[10px] text-slate-600 mt-1">Auto-pause after N files fail back-to-back</p>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1.5">LLM retry attempts per file</label>
+              <Input data-testid="retry-attempts-input" type="number" min={1} max={10}
+                value={config.retry_max_attempts ?? 4}
+                onChange={e => setConfig(s => ({ ...s, retry_max_attempts: parseInt(e.target.value) || 4 }))}
+                className="bg-[#0A0F1C] border-slate-800 text-slate-300 font-mono" />
+              <p className="text-[10px] text-slate-600 mt-1">Exponential backoff: 2s → 10s → 30s → 60s → 120s</p>
+            </div>
           </div>
         </section>
 

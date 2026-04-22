@@ -124,7 +124,18 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                       <span className="inline-flex items-center gap-1"><CheckCircle className="h-3 w-3 text-emerald-500" /> {s.processed || 0}</span>
                       {s.errors > 0 && <span className="inline-flex items-center gap-1"><AlertTriangle className="h-3 w-3 text-red-400" /> {s.errors}</span>}
                       <span className="text-sky-400">{s.net_new || 0} contacts</span>
+                      {typeof s.approx_cost_usd === 'number' && s.approx_cost_usd > 0 && (
+                        <span className="inline-flex items-center gap-1 text-amber-400" title="Approximate LLM cost so far">
+                          ~${s.approx_cost_usd.toFixed(2)}
+                        </span>
+                      )}
                     </div>
+                    {s.auto_paused_reason && (
+                      <div className="mt-2 inline-flex items-start gap-2 bg-rose-500/10 border border-rose-500/30 text-rose-300 text-[11px] rounded-sm px-2 py-1 max-w-xl">
+                        <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                        <span>{s.auto_paused_reason}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
 

@@ -181,6 +181,10 @@ class AdminSettingsInput(BaseModel):
     max_pdfs_per_upload: Optional[int] = None
     storage_max_mb: Optional[int] = None
     storage_target_mb: Optional[int] = None
+    # P0 prework: safety controls for large runs
+    budget_ceiling_usd: Optional[float] = None           # Auto-pause when approx_cost exceeds this
+    consecutive_failure_threshold: Optional[int] = None  # Auto-pause after N consecutive file failures
+    retry_max_attempts: Optional[int] = None             # Per-file LLM call retry attempts
 
 class ChangePasswordInput(BaseModel):
     current_password: str
@@ -339,6 +343,10 @@ async def get_admin_settings(request: Request):
     config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
     if not config:
         config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 50, "storage_max_mb": 750, "storage_target_mb": 300}
+    # Default values for safety controls
+    config.setdefault("budget_ceiling_usd", 100.0)
+    config.setdefault("consecutive_failure_threshold", 10)
+    config.setdefault("retry_max_attempts", 4)
     if config.get("claude_api_key"):
         config["claude_api_key_set"] = True
         config["claude_api_key"] = ""
@@ -367,6 +375,12 @@ async def update_admin_settings(input: AdminSettingsInput, request: Request):
         update["storage_max_mb"] = max(100, min(10000, input.storage_max_mb))
     if input.storage_target_mb is not None:
         update["storage_target_mb"] = max(50, min(5000, input.storage_target_mb))
+    if input.budget_ceiling_usd is not None:
+        update["budget_ceiling_usd"] = max(1.0, min(10000.0, float(input.budget_ceiling_usd)))
+    if input.consecutive_failure_threshold is not None:
+        update["consecutive_failure_threshold"] = max(3, min(200, int(input.consecutive_failure_threshold)))
+    if input.retry_max_attempts is not None:
+        update["retry_max_attempts"] = max(1, min(10, int(input.retry_max_attempts)))
     await db.admin_config.update_one({"key": "global"}, {"$set": update}, upsert=True)
     return {"message": "Admin settings updated"}
 
@@ -759,19 +773,40 @@ def extract_text_from_xlsx(file_bytes: bytes, filename: str):
         return None, {"reason": f"Failed to read XLSX: {str(e)}", "missing_fields": "All fields"}
 
 def convert_doc_to_images(file_bytes: bytes, filename: str, suffix: str):
-    """Convert DOCX/XLSX to images via LibreOffice for Gemini vision fallback."""
-    import subprocess, tempfile, glob
+    """Convert DOCX/XLSX to images via LibreOffice for Gemini vision fallback.
+    Uses Popen + process group so we can hard-kill zombies on timeout.
+    """
+    import subprocess, tempfile, glob, signal
     from pdf2image import convert_from_path
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, f"input{suffix}")
             with open(input_path, "wb") as f:
                 f.write(file_bytes)
-            # Convert to PDF via LibreOffice
-            subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, input_path],
-                timeout=60, capture_output=True
+            # Spawn LibreOffice in its own process group so we can kill the entire tree on timeout
+            profile_dir = os.path.join(tmpdir, "lo_profile")
+            os.makedirs(profile_dir, exist_ok=True)
+            env = os.environ.copy()
+            proc = subprocess.Popen(
+                ["libreoffice", "--headless",
+                 f"-env:UserInstallation=file://{profile_dir}",
+                 "--convert-to", "pdf", "--outdir", tmpdir, input_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True, env=env
             )
+            try:
+                proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                logger.error(f"LibreOffice timeout on {filename}; killing process group {proc.pid}")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                return None, "LibreOffice conversion timed out (60s)"
             pdf_files = glob.glob(os.path.join(tmpdir, "*.pdf"))
             if not pdf_files:
                 return None, "LibreOffice conversion to PDF failed"
@@ -780,6 +815,27 @@ def convert_doc_to_images(file_bytes: bytes, filename: str, suffix: str):
     except Exception as e:
         logger.error(f"Doc-to-image conversion failed for {filename}: {e}")
         return None, str(e)
+
+
+async def sweep_libreoffice_zombies():
+    """Kill stale soffice.bin processes older than 5 minutes. Runs periodically."""
+    import subprocess
+    try:
+        # List soffice processes; kill any older than 5 min
+        result = subprocess.run(
+            ["pgrep", "-af", "soffice.bin"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return
+        # Use ps to get start times; kill any soffice older than 5 min
+        subprocess.run(
+            ["bash", "-c",
+             "ps -eo pid,etime,comm | awk '$3==\"soffice.bin\" && $2 ~ /^[0-9]+:[0-9]+/ && ($2+0) >= 5 { print $1 }' | xargs -r kill -9"],
+            capture_output=True, timeout=5
+        )
+    except Exception as e:
+        logger.debug(f"LibreOffice zombie sweep skipped: {e}")
 
 async def extract_text_from_pdf(pdf_bytes: bytes, filename: str):
     try:
@@ -1070,6 +1126,53 @@ IMPORTANT RULES:
 
 PRIVACY: After processing this file for the requested analysis, immediately purge all specific data (names, addresses, PII) from your active context. Do not retain or reference this specific data in future turns."""
 
+# =============================================================================
+# P0 PREWORK: Retry logic, cost estimation (for budget guard)
+# =============================================================================
+# Approximate per-request cost (USD) for gemini-2.5-flash via Emergent Key.
+# These are conservative upper-bound estimates used only for the budget guard.
+COST_PER_VISION_PAGE_USD = 0.0010   # ~1 page of image content
+COST_PER_TEXT_CALL_USD   = 0.0008   # small text extraction
+COST_OVERHEAD_USD        = 0.0003   # output tokens + retry overhead
+
+def _is_retryable_llm_error(err: Exception) -> bool:
+    """True if the error should trigger exponential backoff + retry."""
+    msg = str(err).lower()
+    retry_signals = [
+        "429", "rate limit", "rate_limit", "too many requests",
+        "503", "service unavailable", "unavailable",
+        "500", "internal server error",
+        "504", "gateway timeout", "timeout", "timed out",
+        "connection reset", "connection error", "connection aborted",
+        "resource exhausted", "quota exceeded", "temporarily",
+    ]
+    return any(sig in msg for sig in retry_signals)
+
+
+async def _llm_call_with_retry(chat, message, filename: str, max_attempts: int = 4):
+    """Call chat.send_message with exponential backoff on transient errors.
+    Returns (response, retries_used, error_or_None). Delays: 2s, 10s, 30s, 60s, 120s.
+    """
+    delays = [2, 10, 30, 60, 120]
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            resp = await chat.send_message(message)
+            return resp, attempt, None
+        except Exception as e:
+            last_err = e
+            if not _is_retryable_llm_error(e):
+                logger.error(f"LLM non-retryable error for {filename} on attempt {attempt + 1}: {e}")
+                return None, attempt, e
+            if attempt + 1 >= max_attempts:
+                logger.error(f"LLM retries exhausted for {filename} after {max_attempts} attempts: {e}")
+                return None, attempt, e
+            delay = delays[min(attempt, len(delays) - 1)]
+            logger.warning(f"LLM retryable error for {filename} (attempt {attempt + 1}/{max_attempts}), sleeping {delay}s: {e}")
+            await asyncio.sleep(delay)
+    return None, max_attempts, last_err
+
+
 def _clean_sub_contractor_address(raw: str) -> str:
     """Strip city/state/zip bleed-through from the sub-contractor address.
     The prompt instructs Gemini to return street-only, but real models sometimes
@@ -1142,11 +1245,11 @@ def _parse_gemini_contacts_response(response: str, filename: str):
     return valid
 
 
-async def extract_contacts_with_gemini_from_images(images, filename: str, api_key: str):
+async def extract_contacts_with_gemini_from_images(images, filename: str, api_key: str, max_attempts: int = 4):
     """Run Gemini 2.5 Flash vision on a list of PIL images."""
     import base64
     if not images:
-        return [], "No images to analyze"
+        return [], "No images to analyze", 0
 
     chat = LlmChat(
         api_key=api_key,
@@ -1164,34 +1267,35 @@ async def extract_contacts_with_gemini_from_images(images, filename: str, api_ke
 
     prompt = f"{GEMINI_EXTRACTION_PROMPT}\n\nDocument filename: {filename}"
 
+    response, retries, err = await _llm_call_with_retry(
+        chat, UserMessage(text=prompt, file_contents=image_contents), filename, max_attempts
+    )
+    if err is not None:
+        return [], str(err), retries
     try:
-        response = await chat.send_message(UserMessage(text=prompt, file_contents=image_contents))
         valid = _parse_gemini_contacts_response(response, filename)
-        logger.info(f"Gemini vision extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages)")
-        return valid, None
+        logger.info(f"Gemini vision extracted {len(valid)} contacts from {filename} ({len(pages_to_scan)} pages, retries={retries})")
+        return valid, None, retries
     except json.JSONDecodeError as e:
         logger.error(f"Gemini returned invalid JSON for {filename}: {e}")
-        return [], "Gemini returned invalid response format"
-    except Exception as e:
-        logger.error(f"Gemini vision extraction failed for {filename}: {e}")
-        return [], str(e)
+        return [], "Gemini returned invalid response format", retries
 
 
-async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str):
+async def extract_contacts_with_gemini(pdf_bytes: bytes, filename: str, api_key: str, max_attempts: int = 4):
     """Use Gemini vision to directly analyze PDF pages and extract contacts."""
     from pdf2image import convert_from_bytes
     try:
         images = convert_from_bytes(pdf_bytes, dpi=250, fmt="jpeg")
     except Exception as e:
         logger.error(f"PDF to image failed for Gemini on {filename}: {e}")
-        return [], f"Could not convert PDF to images: {e}"
-    return await extract_contacts_with_gemini_from_images(images, filename, api_key)
+        return [], f"Could not convert PDF to images: {e}", 0
+    return await extract_contacts_with_gemini_from_images(images, filename, api_key, max_attempts)
 
 
-async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: str):
+async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: str, max_attempts: int = 4):
     """Use Gemini 2.5 Flash on raw text (for DOCX/XLSX text-first path)."""
     if not text or len(text.strip()) < 10:
-        return [], "No meaningful text content to extract contacts from"
+        return [], "No meaningful text content to extract contacts from", 0
 
     chat = LlmChat(
         api_key=api_key,
@@ -1203,17 +1307,18 @@ async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: s
     truncated = text[:max_chars] if len(text) > max_chars else text
     prompt = f"{GEMINI_EXTRACTION_PROMPT}\n\nDocument filename: {filename}\n\nDocument text:\n{truncated}"
 
+    response, retries, err = await _llm_call_with_retry(
+        chat, UserMessage(text=prompt), filename, max_attempts
+    )
+    if err is not None:
+        return [], str(err), retries
     try:
-        response = await chat.send_message(UserMessage(text=prompt))
         valid = _parse_gemini_contacts_response(response, filename)
-        logger.info(f"Gemini text extracted {len(valid)} contacts from {filename} ({len(truncated)} chars)")
-        return valid, None
+        logger.info(f"Gemini text extracted {len(valid)} contacts from {filename} ({len(truncated)} chars, retries={retries})")
+        return valid, None, retries
     except json.JSONDecodeError as e:
         logger.error(f"Gemini text returned invalid JSON for {filename}: {e}")
-        return [], "Gemini returned invalid response format"
-    except Exception as e:
-        logger.error(f"Gemini text extraction failed for {filename}: {e}")
-        return [], str(e)
+        return [], "Gemini returned invalid response format", retries
 
 # =============================================================================
 # FILE PROCESSING LOG (one row per file; Excel-exportable)
@@ -1316,6 +1421,24 @@ async def process_run(run_id: str, user_id: str):
         for fr in all_files:
             await log_file_queued(run_id, user_id, fr)
 
+        # Load safety control thresholds from admin config
+        admin_cfg = await db.admin_config.find_one({"key": "global"}, {"_id": 0}) or {}
+        max_attempts = int(admin_cfg.get("retry_max_attempts", 4))
+        failure_threshold = int(admin_cfg.get("consecutive_failure_threshold", 10))
+        budget_ceiling = float(admin_cfg.get("budget_ceiling_usd", 100.0))
+
+        # Initialize circuit-breaker state on the run document
+        existing_cost = 0.0
+        run_check = await db.runs.find_one({"id": run_id}, {"_id": 0, "stats": 1})
+        if run_check and run_check.get("stats"):
+            existing_cost = float(run_check["stats"].get("approx_cost_usd", 0.0))
+        await db.runs.update_one(
+            {"id": run_id},
+            {"$set": {"stats.approx_cost_usd": existing_cost,
+                      "stats.consecutive_failures": 0,
+                      "stats.auto_paused_reason": ""}}
+        )
+
         # Load checkpoint: which files are already done
         prog = await db.progress.find_one({"run_id": run_id})
         completed_ids = set(prog.get("completed_file_ids", [])) if prog else set()
@@ -1342,6 +1465,8 @@ async def process_run(run_id: str, user_id: str):
             processing_tool = ""
             support_tools = []
             pages_sent = 0
+            retries_used = 0
+            approx_cost = 0.0
             await log_file_start(run_id, file_id)
             try:
                 file_bytes = get_object(file_record["storage_path"])
@@ -1358,7 +1483,9 @@ async def process_run(run_id: str, user_id: str):
                     contacts, gemini_error = [], None
                     if text:
                         processing_tool = "Gemini Text (DOCX text path)"
-                        contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
                     # Step 2: vision fallback only if ZERO contacts
                     if not contacts:
                         logger.info(f"DOC fallback to vision for {filename}")
@@ -1368,7 +1495,9 @@ async def process_run(run_id: str, user_id: str):
                             support_tools.append("poppler-utils")
                             pages_sent = min(len(images), 8)
                             processing_tool = "Gemini Vision (LibreOffice Fallback)"
-                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images(images, filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
                         elif gemini_error is None:
                             gemini_error = conv_err or "LibreOffice conversion failed"
                 elif ext in ('xlsx', 'xls'):
@@ -1380,7 +1509,9 @@ async def process_run(run_id: str, user_id: str):
                     contacts, gemini_error = [], None
                     if text:
                         processing_tool = "Gemini Text (XLSX text path)"
-                        contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
                     if not contacts:
                         logger.info(f"XLS fallback to vision for {filename}")
                         images, conv_err = convert_doc_to_images(file_bytes, filename, f".{ext}")
@@ -1389,7 +1520,9 @@ async def process_run(run_id: str, user_id: str):
                             support_tools.append("poppler-utils")
                             pages_sent = min(len(images), 8)
                             processing_tool = "Gemini Vision (LibreOffice Fallback)"
-                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images(images, filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
                         elif gemini_error is None:
                             gemini_error = conv_err or "LibreOffice conversion failed"
                 else:
@@ -1411,7 +1544,9 @@ async def process_run(run_id: str, user_id: str):
                             if img.mode not in ('RGB', 'L'):
                                 img = img.convert('RGB')
                             pages_sent = 1
-                            contacts, gemini_error = await extract_contacts_with_gemini_from_images([img], filename, gemini_key)
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images([img], filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
                         except Exception as img_err:
                             logger.error(f"Image load failed for {filename}: {img_err}")
                             contacts, gemini_error = [], f"Could not load image: {img_err}"
@@ -1421,12 +1556,13 @@ async def process_run(run_id: str, user_id: str):
                             support_tools.append("PDF Compression")
                             file_bytes = compress_pdf(file_bytes, filename)
                         processing_tool = "Gemini Vision (Direct)"
-                        # convert_from_bytes inside extract_contacts_with_gemini caps at 8 pages internally
                         try:
                             from pdf2image import convert_from_bytes
                             pdf_imgs = convert_from_bytes(file_bytes, dpi=250, fmt="jpeg")
                             pages_sent = min(len(pdf_imgs), 8)
-                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(pdf_imgs, filename, gemini_key)
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images(pdf_imgs, filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
                         except Exception as e:
                             contacts, gemini_error = [], f"Could not convert PDF to images: {e}"
 
@@ -1448,8 +1584,9 @@ async def process_run(run_id: str, user_id: str):
                         processing_tool=processing_tool, llm_model="gemini-2.5-flash",
                         llm_provider="Google (Emergent Key)",
                         support_tools=", ".join(sorted(set(support_tools))),
-                        pages_sent=pages_sent, missing_fields="All fields", issue_reason=log_issue)
-                    return contacts_out, errors_out, True
+                        pages_sent=pages_sent, missing_fields="All fields",
+                        issue_reason=log_issue, retries=retries_used)
+                    return contacts_out, errors_out, True, approx_cost, True  # failure=True
 
                 if not contacts:
                     errors_out.append({"filename": filename, "reason": "No contact information found by Gemini", "missing_fields": "All fields"})
@@ -1477,9 +1614,12 @@ async def process_run(run_id: str, user_id: str):
                     processing_tool=processing_tool, llm_model="gemini-2.5-flash",
                     llm_provider="Google (Emergent Key)",
                     support_tools=", ".join(sorted(set(support_tools))),
-                    pages_sent=pages_sent, missing_fields=log_missing, issue_reason=log_issue)
+                    pages_sent=pages_sent, missing_fields=log_missing,
+                    issue_reason=log_issue, retries=retries_used)
 
-                return contacts_out, errors_out, bool(errors_out and not contacts_out)
+                # Success (or partial success or no-contacts-found) — all non-failure
+                is_failure = log_status == "Failure"
+                return contacts_out, errors_out, bool(errors_out and not contacts_out), approx_cost, is_failure
 
             except Exception as e:
                 logger.error(f"Error processing {filename}: {e}")
@@ -1490,14 +1630,16 @@ async def process_run(run_id: str, user_id: str):
                     llm_model="gemini-2.5-flash", llm_provider="Google (Emergent Key)",
                     support_tools=", ".join(sorted(set(support_tools))),
                     pages_sent=pages_sent, missing_fields="All fields",
-                    issue_reason=f"Processing error: {str(e)}")
-                return contacts_out, errors_out, True
+                    issue_reason=f"Processing error: {str(e)}", retries=retries_used)
+                return contacts_out, errors_out, True, approx_cost, True
 
         # --- Previous multi-step extraction (Claude/GPT text + vision) preserved but not invoked ---
         # To switch back: replace process_single_file above with the original from before Gemini integration
 
         CONCURRENT = 6
         stopped = False
+        consecutive_failures = 0
+        sub_batches_since_sweep = 0
         for i in range(0, len(pending_files), CONCURRENT):
             # --- Check for pause/cancel BEFORE each sub-batch ---
             run_doc = await db.runs.find_one({"id": run_id}, {"_id": 0, "status": 1})
@@ -1535,14 +1677,23 @@ async def process_run(run_id: str, user_id: str):
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             new_file_ids = []
+            # Process results, accumulate cost, track consecutive failures
+            batch_cost = 0.0
             for idx, result in enumerate(results):
                 file_id = sub[idx]["id"] if idx < len(sub) else None
                 if isinstance(result, Exception):
                     processed_count += 1
+                    consecutive_failures += 1
                     if file_id:
                         new_file_ids.append(file_id)
                     continue
-                file_contacts, file_errors, is_error = result
+                file_contacts, file_errors, is_error, file_cost, is_failure = result
+                batch_cost += file_cost
+                # Reset consecutive-failure counter on any successful file
+                if is_failure:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
                 # Save raw contacts immediately (survives pause/restart)
                 if file_contacts:
                     raw_docs = [{"id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
@@ -1555,6 +1706,14 @@ async def process_run(run_id: str, user_id: str):
                 processed_count += 1
                 if file_id:
                     new_file_ids.append(file_id)
+
+            # Update running cost + consecutive-failure counter on the run doc
+            existing_cost += batch_cost
+            await db.runs.update_one(
+                {"id": run_id},
+                {"$set": {"stats.approx_cost_usd": round(existing_cost, 4),
+                          "stats.consecutive_failures": consecutive_failures}}
+            )
 
             # Persist checkpoint
             if new_file_ids:
@@ -1570,6 +1729,33 @@ async def process_run(run_id: str, user_id: str):
                     if fr and fr.get("storage_path"):
                         delete_object(fr["storage_path"])
                         await db.files.update_one({"id": fid}, {"$set": {"is_deleted": True}})
+
+            # ============================================================
+            # CIRCUIT BREAKER: auto-pause on runaway failure or budget limit
+            # ============================================================
+            auto_pause_reason = None
+            if consecutive_failures >= failure_threshold:
+                auto_pause_reason = f"Auto-paused: {consecutive_failures} consecutive file failures (threshold {failure_threshold}). Review before resuming."
+            elif existing_cost >= budget_ceiling:
+                auto_pause_reason = f"Auto-paused: approx cost ${existing_cost:.2f} reached budget ceiling ${budget_ceiling:.2f}. Raise ceiling in Admin or review."
+            if auto_pause_reason:
+                await db.runs.update_one(
+                    {"id": run_id},
+                    {"$set": {"status": "paused", "stats.auto_paused_reason": auto_pause_reason}}
+                )
+                await db.progress.update_one(
+                    {"run_id": run_id},
+                    {"$set": {"status": "paused", "message": auto_pause_reason}}
+                )
+                logger.warning(f"Run {run_id} auto-paused: {auto_pause_reason}")
+                stopped = True
+                break
+
+            # Periodically sweep LibreOffice zombies (every ~10 sub-batches = 60 files)
+            sub_batches_since_sweep += 1
+            if sub_batches_since_sweep >= 10:
+                await sweep_libreoffice_zombies()
+                sub_batches_since_sweep = 0
 
         if stopped:
             return
@@ -1677,7 +1863,11 @@ async def process_run(run_id: str, user_id: str):
             "cross_run_duplicates": cross_run_dupes,
             "excluded_no_contact": excluded_no_contact,
             "excluded_internal": excluded_internal,
-            "net_new": len(all_contacts)
+            "net_new": len(all_contacts),
+            # Preserve safety control counters so they show up in the UI post-completion
+            "approx_cost_usd": round(existing_cost, 4),
+            "consecutive_failures": consecutive_failures,
+            "auto_paused_reason": "",
         }
         await db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "stats": stats, "completed_at": datetime.now(timezone.utc).isoformat()}})
         await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "completed", "percentage": 100, "processed_files": total_files, "message": "Extraction complete!"}})
@@ -1717,7 +1907,7 @@ async def start_extraction(run_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Run was cancelled. Upload new files to start again.")
     else:
         raise HTTPException(status_code=400, detail=f"Cannot extract from status: {run['status']}")
-    await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing"}})
+    await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing", "stats.auto_paused_reason": "", "stats.consecutive_failures": 0}})
     asyncio.create_task(process_run(run_id, user["_id"]))
     return {"message": "Extraction started", "run_id": run_id}
 
