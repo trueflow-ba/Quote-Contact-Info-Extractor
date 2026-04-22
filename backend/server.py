@@ -1985,26 +1985,37 @@ async def start_extraction(run_id: str, request: Request):
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    # Allow retry/resume on stale, paused, or failed runs
-    if run["status"] in ("processing", "stale"):
+    status = run["status"]
+    # Allow retry/resume on stale, paused, pausing, or failed runs
+    if status == "processing":
         prog = await db.progress.find_one({"run_id": run_id}, {"_id": 0})
         if prog and prog.get("status") == "processing":
             raise HTTPException(status_code=400, detail="Run is already being processed")
-    if run["status"] == "paused":
+    if status == "pausing":
+        # User changed their mind — flip back to processing, don't spawn a new task
+        # (the existing background task will see 'processing' and keep going)
+        logger.info(f"Run {run_id} was pausing; reverting to processing (no new task)")
+        await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing", "stats.auto_paused_reason": "", "stats.consecutive_failures": 0}})
+        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "processing"}})
+        return {"message": "Pause cancelled — continuing", "run_id": run_id}
+    if status == "paused":
         logger.info(f"Resuming paused run {run_id}")
-    elif run["status"] in ("stale", "failed"):
-        logger.info(f"Retrying {run['status']} run {run_id}")
+    elif status in ("stale", "failed"):
+        logger.info(f"Retrying {status} run {run_id}")
         # Clean up previous final data but keep raw_contacts + errors for resume
         await db.contacts.delete_many({"run_id": run_id})
         await db.duplicates.delete_many({"run_id": run_id})
-    elif run["status"] == "uploaded":
+    elif status == "uploaded":
         pass  # Fresh start
-    elif run["status"] == "completed":
+    elif status == "completed":
         raise HTTPException(status_code=400, detail="Run already completed")
-    elif run["status"] == "cancelled":
+    elif status == "cancelled":
         raise HTTPException(status_code=400, detail="Run was cancelled. Upload new files to start again.")
+    elif status == "processing":
+        # Already processing, do nothing
+        return {"message": "Run already processing", "run_id": run_id}
     else:
-        raise HTTPException(status_code=400, detail=f"Cannot extract from status: {run['status']}")
+        raise HTTPException(status_code=400, detail=f"Cannot extract from status: {status}")
     await db.runs.update_one({"id": run_id}, {"$set": {"status": "processing", "stats.auto_paused_reason": "", "stats.consecutive_failures": 0}})
     asyncio.create_task(process_run(run_id, user["_id"]))
     return {"message": "Extraction started", "run_id": run_id}
@@ -2015,8 +2026,14 @@ async def pause_run(run_id: str, request: Request):
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] != "processing":
-        raise HTTPException(status_code=400, detail="Can only pause a processing run")
+    status = run["status"]
+    if status == "pausing":
+        # Idempotent — already pausing, just acknowledge
+        return {"message": "Already pausing — will complete shortly"}
+    if status == "paused":
+        return {"message": "Already paused"}
+    if status != "processing":
+        raise HTTPException(status_code=400, detail=f"Can only pause a processing run (current: {status})")
     await db.runs.update_one({"id": run_id}, {"$set": {"status": "pausing"}})
     return {"message": "Pause signal sent — will pause after current file completes"}
 
