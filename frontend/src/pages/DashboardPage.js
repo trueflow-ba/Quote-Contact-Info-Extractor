@@ -159,16 +159,53 @@ export default function DashboardPage() {
     startPolling(runId);
   };
 
+  const CHUNK_SIZE = 25 * 1024 * 1024; // 25 MB per chunk — safely under ingress limit
+  const CHUNK_THRESHOLD = 200 * 1024 * 1024; // Use chunked upload when any single file > 200 MB
+
+  const uploadSingleFileInChunks = async (file, onProgress) => {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const { data: initRes } = await api.post('/upload/chunk/init', {
+      filename: file.name, total_size: file.size, total_chunks: totalChunks
+    });
+    const uploadId = initRes.upload_id;
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      const blob = file.slice(start, end);
+      const fd = new FormData();
+      fd.append('index', String(i));
+      fd.append('chunk', blob, `chunk_${i}`);
+      await api.post(`/upload/chunk/${uploadId}`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000
+      });
+      if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
+    }
+    const { data } = await api.post(`/upload/chunk/${uploadId}/complete`, {}, { timeout: 300000 });
+    return data;
+  };
+
   const handleExtract = async () => {
     if (files.length === 0) { toast.error('Please select files to upload'); return; }
     setIsUploading(true);
     try {
-      const formData = new FormData();
-      files.forEach(f => formData.append('files', f));
-      const { data: uploadData } = await api.post('/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 300000 // 5 min timeout for the initial POST
-      });
+      const useChunked = files.length === 1 && files[0].size > CHUNK_THRESHOLD;
+      let uploadData;
+      if (useChunked) {
+        const f = files[0];
+        setProgress({ status: 'uploading', percentage: 0, message: `Uploading large file in chunks (0%)...` });
+        uploadData = await uploadSingleFileInChunks(f, (pct) => {
+          setProgress({ status: 'uploading', percentage: Math.round(pct * 0.5), message: `Uploading large file in chunks (${pct}%)...` });
+        });
+      } else {
+        const formData = new FormData();
+        files.forEach(f => formData.append('files', f));
+        const resp = await api.post('/upload', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 300000
+        });
+        uploadData = resp.data;
+      }
       const runId = uploadData.run_id;
       setCurrentRunId(runId);
       setFiles([]);
@@ -179,7 +216,7 @@ export default function DashboardPage() {
       }
       setIsUploading(false);
       setIsProcessing(true);
-      setProgress({ status: 'uploading', percentage: 0, message: 'Uploading PDFs to storage...' });
+      setProgress({ status: 'uploading', percentage: 50, message: 'Uploading PDFs to storage...' });
 
       // Poll until upload finishes, then auto-start extraction
       const uploadPoll = setInterval(async () => {
@@ -200,7 +237,13 @@ export default function DashboardPage() {
         } catch {}
       }, 2000);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Upload failed');
+      const detail = err?.response?.data?.detail;
+      const status = err?.response?.status;
+      if (status === 413) {
+        toast.error('File too large for direct upload. Try reducing ZIP size or splitting further.');
+      } else {
+        toast.error(detail || err?.message || 'Upload failed');
+      }
       setIsUploading(false);
       setIsProcessing(false);
     }

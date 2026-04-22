@@ -4,16 +4,21 @@ import { Upload, X, FileText, Archive } from 'lucide-react';
 export default function UploadZone({ files, setFiles }) {
   const inputRef = useRef(null);
 
+  const ACCEPTED_EXTENSIONS = ['.pdf', '.zip', '.docx', '.doc', '.xlsx', '.xls',
+    '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp'];
+  const isAccepted = (name) => {
+    const n = (name || '').toLowerCase();
+    return ACCEPTED_EXTENSIONS.some(ext => n.endsWith(ext));
+  };
+
   const handleDrop = useCallback((e) => {
     e.preventDefault();
-    const dropped = Array.from(e.dataTransfer.files).filter(
-      f => f.name.toLowerCase().endsWith('.pdf') || f.name.toLowerCase().endsWith('.zip')
-    );
+    const dropped = Array.from(e.dataTransfer.files).filter(f => isAccepted(f.name));
     setFiles(prev => [...prev, ...dropped]);
   }, [setFiles]);
 
   const handleSelect = (e) => {
-    const selected = Array.from(e.target.files);
+    const selected = Array.from(e.target.files).filter(f => isAccepted(f.name));
     setFiles(prev => [...prev, ...selected]);
     e.target.value = '';
   };
@@ -44,7 +49,7 @@ export default function UploadZone({ files, setFiles }) {
           ref={inputRef}
           type="file"
           multiple
-          accept=".pdf,.zip"
+          accept=".pdf,.zip,.docx,.doc,.xlsx,.xls,.jpg,.jpeg,.png,.webp,.heic,.heif,.tiff,.tif,.bmp"
           onChange={handleSelect}
           className="hidden"
           data-testid="file-upload-input"

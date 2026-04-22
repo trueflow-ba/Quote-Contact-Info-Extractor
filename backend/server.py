@@ -16,7 +16,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, UploadFile, File
+from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -517,26 +517,26 @@ def get_api_key_for_model(ai_model: str, admin_config: dict) -> str:
 # =============================================================================
 # UPLOAD ROUTES
 # =============================================================================
-@api_router.post("/upload")
-async def upload_files(request: Request, files: List[UploadFile] = File(...)):
-    user = await get_current_user(request)
-    user_id = user["_id"]
+# Files staged for chunked uploads live here (ephemeral container disk)
+CHUNK_UPLOAD_DIR = "/tmp/chunked_uploads"
+os.makedirs(CHUNK_UPLOAD_DIR, exist_ok=True)
+
+# Accepted extensions for inputs (PDF-style docs + images; ZIP is handled separately)
+SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls',
+                        '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp')
+
+
+async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_pdfs: int):
+    """Shared core: given list of (filename, bytes), unzip if needed, create a run,
+    queue background object-storage upload, return result dict.
+    Used by BOTH the legacy `/upload` and chunked `/upload/chunk/{id}/complete`.
+    """
     run_id = str(uuid.uuid4())
-
-    # Get max PDF limit from admin config
-    admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
-    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
-
-    # Phase 1: Quick — read files into memory, count PDFs, create run record immediately
-    pdf_buffers = []  # list of (filename, bytes)
+    pdf_buffers = []
     rejected_files = []
 
-    SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls',
-                            '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp')
-
-    for file in files:
-        data = await file.read()
-        fname_lower = file.filename.lower()
+    for filename, data in filename_bytes_pairs:
+        fname_lower = filename.lower()
         if fname_lower.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -551,18 +551,17 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             if len(pdf_buffers) >= max_pdfs:
-                rejected_files.append(file.filename)
+                rejected_files.append(filename)
                 continue
-            pdf_buffers.append((file.filename, data))
+            pdf_buffers.append((filename, data))
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}. Accepted: PDF, DOCX, XLSX, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}. Accepted: PDF, DOCX, XLSX, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
 
     if not pdf_buffers:
         raise HTTPException(status_code=400, detail="No supported files found in upload")
 
     total_files = len(pdf_buffers)
 
-    # Create run record immediately so frontend gets a fast response
     run_doc = {
         "id": run_id, "user_id": user_id, "status": "uploading",
         "total_files": total_files,
@@ -580,7 +579,6 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
         upsert=True
     )
 
-    # Phase 2: Background — upload PDFs to object storage
     async def upload_to_storage():
         try:
             file_records = []
@@ -644,6 +642,106 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
         result["rejected_files"] = rejected_files[:10]
         result["message"] = f"Upload limit is {max_pdfs} PDFs. {len(rejected_files)} file(s) were rejected."
     return result
+
+
+@api_router.post("/upload")
+async def upload_files(request: Request, files: List[UploadFile] = File(...)):
+    """Direct upload — works for small files (< ~400 MB total). For larger payloads
+    use the chunked-upload endpoints below.
+    """
+    user = await get_current_user(request)
+    admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
+    pairs = []
+    for file in files:
+        pairs.append((file.filename, await file.read()))
+    return await _process_uploaded_bytes(user["_id"], pairs, max_pdfs)
+
+
+# =============================================================================
+# CHUNKED UPLOAD (for large ZIPs that exceed ingress body-size limit)
+# =============================================================================
+class ChunkInitInput(BaseModel):
+    filename: str
+    total_size: int
+    total_chunks: int
+
+
+@api_router.post("/upload/chunk/init")
+async def chunk_init(input: ChunkInitInput, request: Request):
+    user = await get_current_user(request)
+    upload_id = str(uuid.uuid4())
+    os.makedirs(os.path.join(CHUNK_UPLOAD_DIR, upload_id), exist_ok=True)
+    await db.chunk_uploads.insert_one({
+        "upload_id": upload_id,
+        "user_id": user["_id"],
+        "filename": input.filename,
+        "total_size": int(input.total_size),
+        "total_chunks": int(input.total_chunks),
+        "received_chunks": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"upload_id": upload_id}
+
+
+@api_router.post("/upload/chunk/{upload_id}")
+async def chunk_upload(upload_id: str, request: Request,
+                       index: int = Form(...),
+                       chunk: UploadFile = File(...)):
+    user = await get_current_user(request)
+    session = await db.chunk_uploads.find_one({"upload_id": upload_id, "user_id": user["_id"]})
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    if index < 0 or index >= session["total_chunks"]:
+        raise HTTPException(status_code=400, detail="Chunk index out of range")
+    chunk_dir = os.path.join(CHUNK_UPLOAD_DIR, upload_id)
+    chunk_path = os.path.join(chunk_dir, f"chunk_{index:06d}.bin")
+    data = await chunk.read()
+    with open(chunk_path, "wb") as f:
+        f.write(data)
+    await db.chunk_uploads.update_one(
+        {"upload_id": upload_id},
+        {"$addToSet": {"received_chunks": index}}
+    )
+    session = await db.chunk_uploads.find_one({"upload_id": upload_id})
+    return {"received": len(session.get("received_chunks", [])),
+            "total_chunks": session["total_chunks"]}
+
+
+@api_router.post("/upload/chunk/{upload_id}/complete")
+async def chunk_complete(upload_id: str, request: Request):
+    user = await get_current_user(request)
+    session = await db.chunk_uploads.find_one({"upload_id": upload_id, "user_id": user["_id"]})
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    received = sorted(set(session.get("received_chunks", [])))
+    expected = list(range(session["total_chunks"]))
+    if received != expected:
+        missing = sorted(set(expected) - set(received))
+        raise HTTPException(status_code=400, detail=f"Missing chunks: {missing[:10]}")
+
+    chunk_dir = os.path.join(CHUNK_UPLOAD_DIR, upload_id)
+    # Reassemble into single bytes blob
+    parts = []
+    for i in range(session["total_chunks"]):
+        p = os.path.join(chunk_dir, f"chunk_{i:06d}.bin")
+        with open(p, "rb") as f:
+            parts.append(f.read())
+    full_bytes = b"".join(parts)
+    if len(full_bytes) != session["total_size"]:
+        logger.warning(f"Chunked upload {upload_id} size mismatch: got {len(full_bytes)}, expected {session['total_size']}")
+
+    # Cleanup chunks immediately
+    try:
+        import shutil as _sh
+        _sh.rmtree(chunk_dir, ignore_errors=True)
+    except Exception:
+        pass
+    await db.chunk_uploads.delete_one({"upload_id": upload_id})
+
+    admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
+    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
+    return await _process_uploaded_bytes(user["_id"], [(session["filename"], full_bytes)], max_pdfs)
 
 # =============================================================================
 # EXTRACTION ENGINE — Multi-OCR with fallback + PDF compression
