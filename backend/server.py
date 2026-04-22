@@ -1576,29 +1576,45 @@ async def process_run(run_id: str, user_id: str):
             try:
                 # ============================================================
                 # CONTENT-HASH DEDUP: skip if this exact byte-content was
-                # already processed in an earlier run for this user. The old
-                # contacts stay in the database; "All Contacts" will show them.
+                # already processed in an earlier run for this user. Also
+                # matches on (filename + size) as a fallback for historical
+                # records that predate the sha256 column.
                 # ============================================================
                 sha = file_record.get("sha256")
+                prior_file = None
                 if sha:
                     prior_file = await db.files.find_one(
                         {"user_id": user_id, "sha256": sha, "id": {"$ne": file_id}},
                         {"_id": 0, "run_id": 1, "original_filename": 1, "created_at": 1},
-                        sort=[("created_at", 1)]  # oldest match first
+                        sort=[("created_at", 1)]
                     )
-                    if prior_file:
-                        prior_name = prior_file.get('original_filename', '?')
-                        await log_file_finish(run_id, file_id,
-                            status="Skipped (Duplicate Content)",
-                            contacts_extracted=0,
-                            processing_tool="Content hash match (no LLM call)",
-                            llm_model="", llm_provider="",
-                            support_tools="SHA-256 dedup",
-                            pages_sent=0, missing_fields="",
-                            issue_reason=f"Identical byte-content already analyzed as {prior_name!r} — skipped to save cost. Original contacts remain in All Contacts.",
-                            retries=0)
-                        logger.info(f"Skipped duplicate content for {filename} (hash={sha[:12]} matched prior file {prior_name!r})")
-                        return contacts_out, errors_out, False, 0.0, False
+                if not prior_file:
+                    # Legacy fallback: exact filename + byte size match (no content hash available)
+                    prior_file = await db.files.find_one(
+                        {"user_id": user_id,
+                         "original_filename": filename,
+                         "size": file_record.get("size", 0),
+                         "id": {"$ne": file_id},
+                         "created_at": {"$lt": file_record.get("created_at", "")}},
+                        {"_id": 0, "run_id": 1, "original_filename": 1, "created_at": 1},
+                        sort=[("created_at", 1)]
+                    )
+                    match_type = "filename + size match" if prior_file else None
+                else:
+                    match_type = "SHA-256 content hash match"
+                if prior_file:
+                    prior_name = prior_file.get('original_filename', '?')
+                    await log_file_finish(run_id, file_id,
+                        status="Skipped (Duplicate Content)",
+                        contacts_extracted=0,
+                        processing_tool=f"{match_type} (no LLM call)",
+                        llm_model="", llm_provider="",
+                        support_tools="SHA-256 dedup" if sha else "Filename+size dedup",
+                        pages_sent=0, missing_fields="",
+                        issue_reason=f"Already analyzed as {prior_name!r} — skipped to save cost. Original contacts remain in All Contacts.",
+                        retries=0)
+                    logger.info(f"Skipped {filename} via {match_type} (prior: {prior_name!r})")
+                    return contacts_out, errors_out, False, 0.0, False
 
                 file_bytes = get_object(file_record["storage_path"])
                 gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
@@ -2428,38 +2444,57 @@ async def download_run_log_xlsx(run_id: str, request: Request):
 # =============================================================================
 @api_router.get("/skip-registry/export")
 async def export_skip_registry(request: Request):
-    """Download a CSV of every file this user has processed, keyed by sha256."""
+    """Download a CSV of every file this user has processed, keyed by sha256 when
+    available and by (filename, size) otherwise. Re-import to restore dedup after
+    a container rebuild.
+    """
     user = await get_current_user(request)
-    # Aggregate: unique hashes across all file records, joined with file_logs
     files_cursor = db.files.find(
-        {"user_id": user["_id"], "sha256": {"$exists": True, "$ne": ""}},
-        {"_id": 0, "sha256": 1, "original_filename": 1, "run_id": 1, "created_at": 1}
+        {"user_id": user["_id"]},
+        {"_id": 0, "sha256": 1, "original_filename": 1, "size": 1, "run_id": 1, "created_at": 1}
     )
+    # Dedupe by: sha256 if present; otherwise by (filename, size)
     seen_hashes = set()
+    seen_legacy = set()
     rows = []
     async for f in files_cursor:
-        h = f.get("sha256")
-        if not h or h in seen_hashes:
+        h = f.get("sha256") or ""
+        fname = f.get("original_filename", "")
+        size = f.get("size", 0)
+        dedup_key = h if h else f"LEGACY::{fname}::{size}"
+        if h and h in seen_hashes:
             continue
-        seen_hashes.add(h)
+        if not h:
+            if dedup_key in seen_legacy:
+                continue
+            seen_legacy.add(dedup_key)
+        else:
+            seen_hashes.add(h)
+        # Attach status + contacts_count from file_logs if present; otherwise fall back
         log = await db.file_logs.find_one(
-            {"user_id": user["_id"], "sha256": h},
+            {"user_id": user["_id"], "run_id": f.get("run_id"), "filename": fname},
             {"_id": 0, "status": 1, "contacts_extracted": 1, "completed_at": 1}
         )
+        if not log and h:
+            log = await db.file_logs.find_one(
+                {"user_id": user["_id"], "sha256": h},
+                {"_id": 0, "status": 1, "contacts_extracted": 1, "completed_at": 1}
+            )
         rows.append({
-            "filename": f.get("original_filename", ""),
+            "filename": fname,
             "sha256": h,
+            "size": size,
             "processed_at": (log or {}).get("completed_at") or f.get("created_at", ""),
             "run_id": f.get("run_id", ""),
             "contacts_count": (log or {}).get("contacts_extracted", 0),
-            "status": (log or {}).get("status", "Success"),
+            "status": (log or {}).get("status", "Processed"),
         })
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["filename", "sha256", "processed_at", "run_id", "contacts_count", "status"])
+    writer.writerow(["filename", "sha256", "size", "processed_at", "run_id", "contacts_count", "status"])
     for r in rows:
-        writer.writerow([r["filename"], r["sha256"], r["processed_at"], r["run_id"], r["contacts_count"], r["status"]])
+        writer.writerow([r["filename"], r["sha256"], r["size"], r["processed_at"], r["run_id"], r["contacts_count"], r["status"]])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -2471,8 +2506,9 @@ async def export_skip_registry(request: Request):
 @api_router.post("/skip-registry/import")
 async def import_skip_registry(request: Request, file: UploadFile = File(...)):
     """Re-populate the dedup registry from a previously exported CSV.
-    Creates minimal `files` records (is_deleted=True) so future uploads with
-    matching sha256 are skipped. Safe to re-import multiple times (idempotent on sha256).
+    Creates minimal `files` records so future uploads with matching
+    sha256 (or filename+size for legacy entries) are skipped.
+    Safe to re-import repeatedly (idempotent).
     """
     user = await get_current_user(request)
     if not (file.filename or "").lower().endswith(".csv"):
@@ -2483,20 +2519,30 @@ async def import_skip_registry(request: Request, file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Unreadable file")
     reader = csv.DictReader(io.StringIO(text))
-    required_cols = {"filename", "sha256"}
-    if not required_cols.issubset(set(reader.fieldnames or [])):
-        raise HTTPException(status_code=400, detail=f"CSV missing required columns: {required_cols - set(reader.fieldnames or [])}")
+    if "filename" not in (reader.fieldnames or []):
+        raise HTTPException(status_code=400, detail="CSV missing required column 'filename'")
     imported_run_id = f"imported-{uuid.uuid4()}"
     imported = 0
     skipped = 0
     for row in reader:
         sha = (row.get("sha256") or "").strip()
         fname = (row.get("filename") or "").strip()
-        if not sha or len(sha) != 64:
+        try:
+            size = int(row.get("size") or 0)
+        except ValueError:
+            size = 0
+        if not fname:
             skipped += 1
             continue
-        # Skip if we already have this hash for this user (idempotent)
-        existing = await db.files.find_one({"user_id": user["_id"], "sha256": sha}, {"_id": 0, "id": 1})
+        # Idempotent check — sha first, then legacy (filename+size)
+        existing = None
+        if sha and len(sha) == 64:
+            existing = await db.files.find_one({"user_id": user["_id"], "sha256": sha}, {"_id": 0, "id": 1})
+        if not existing:
+            existing = await db.files.find_one(
+                {"user_id": user["_id"], "original_filename": fname, "size": size},
+                {"_id": 0, "id": 1}
+            )
         if existing:
             skipped += 1
             continue
@@ -2504,12 +2550,12 @@ async def import_skip_registry(request: Request, file: UploadFile = File(...)):
             "id": str(uuid.uuid4()),
             "run_id": row.get("run_id") or imported_run_id,
             "user_id": user["_id"],
-            "storage_path": "",  # intentionally empty — file isn't in object storage
+            "storage_path": "",
             "original_filename": fname,
             "content_type": "",
-            "size": 0,
-            "sha256": sha,
-            "is_deleted": True,  # marker: hash-only record, no object to retrieve
+            "size": size,
+            "sha256": sha if (sha and len(sha) == 64) else "",
+            "is_deleted": True,
             "imported_from_registry": True,
             "imported_processed_at": row.get("processed_at") or "",
             "imported_contacts_count": int(row.get("contacts_count") or 0),
@@ -2586,6 +2632,7 @@ async def startup():
     await db.file_logs.create_index([("run_id", 1), ("filename", 1)])
     await db.file_logs.create_index([("user_id", 1), ("run_id", 1)])
     await db.files.create_index([("user_id", 1), ("sha256", 1)])
+    await db.files.create_index([("user_id", 1), ("original_filename", 1), ("size", 1)])
     await db.duplicates.create_index("run_id")
     await db.raw_contacts.create_index("run_id")
     # Recover stale "processing" runs from server restarts
