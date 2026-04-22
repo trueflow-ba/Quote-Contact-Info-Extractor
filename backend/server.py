@@ -531,9 +531,13 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
     queue background object-storage upload, return result dict.
     Used by BOTH the legacy `/upload` and chunked `/upload/chunk/{id}/complete`.
     """
+    import hashlib as _hashlib
     run_id = str(uuid.uuid4())
-    pdf_buffers = []
+    pdf_buffers = []  # list of (filename, bytes, sha256_hex)
     rejected_files = []
+
+    def _sha256_hex(data: bytes) -> str:
+        return _hashlib.sha256(data).hexdigest()
 
     for filename, data in filename_bytes_pairs:
         fname_lower = filename.lower()
@@ -546,14 +550,15 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                             if len(pdf_buffers) >= max_pdfs:
                                 rejected_files.append(name.split("/")[-1])
                                 continue
-                            pdf_buffers.append((name.split("/")[-1], zf.read(name)))
+                            inner_bytes = zf.read(name)
+                            pdf_buffers.append((name.split("/")[-1], inner_bytes, _sha256_hex(inner_bytes)))
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             if len(pdf_buffers) >= max_pdfs:
                 rejected_files.append(filename)
                 continue
-            pdf_buffers.append((filename, data))
+            pdf_buffers.append((filename, data, _sha256_hex(data)))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}. Accepted: PDF, DOCX, XLSX, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
 
@@ -583,7 +588,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
         try:
             file_records = []
             failed_uploads = 0
-            for idx, (filename, pdf_data) in enumerate(pdf_buffers):
+            for idx, (filename, pdf_data, sha256_hex) in enumerate(pdf_buffers):
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
                 ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                           'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
@@ -597,6 +602,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                         "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
                         "storage_path": storage_path, "original_filename": filename,
                         "content_type": content_type, "size": len(pdf_data),
+                        "sha256": sha256_hex,
                         "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
                     })
                 except Exception as e:
@@ -1567,6 +1573,32 @@ async def process_run(run_id: str, user_id: str):
             approx_cost = 0.0
             await log_file_start(run_id, file_id)
             try:
+                # ============================================================
+                # CONTENT-HASH DEDUP: skip if this exact byte-content was
+                # already processed in an earlier run for this user. The old
+                # contacts stay in the database; "All Contacts" will show them.
+                # ============================================================
+                sha = file_record.get("sha256")
+                if sha:
+                    prior_file = await db.files.find_one(
+                        {"user_id": user_id, "sha256": sha, "id": {"$ne": file_id}},
+                        {"_id": 0, "run_id": 1, "original_filename": 1, "created_at": 1},
+                        sort=[("created_at", 1)]  # oldest match first
+                    )
+                    if prior_file:
+                        prior_name = prior_file.get('original_filename', '?')
+                        await log_file_finish(run_id, file_id,
+                            status="Skipped (Duplicate Content)",
+                            contacts_extracted=0,
+                            processing_tool="Content hash match (no LLM call)",
+                            llm_model="", llm_provider="",
+                            support_tools="SHA-256 dedup",
+                            pages_sent=0, missing_fields="",
+                            issue_reason=f"Identical byte-content already analyzed as {prior_name!r} — skipped to save cost. Original contacts remain in All Contacts.",
+                            retries=0)
+                        logger.info(f"Skipped duplicate content for {filename} (hash={sha[:12]} matched prior file {prior_name!r})")
+                        return contacts_out, errors_out, False, 0.0, False
+
                 file_bytes = get_object(file_record["storage_path"])
                 gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
@@ -2343,6 +2375,7 @@ async def download_run_log_xlsx(run_id: str, request: Request):
         "No Contacts Found":  PatternFill("solid", fgColor="E0E7FF"),  # blue tint
         "Failure":            PatternFill("solid", fgColor="FEE2E2"),  # red tint
         "Skipped":            PatternFill("solid", fgColor="F1F5F9"),  # gray tint
+        "Skipped (Duplicate Content)": PatternFill("solid", fgColor="EDE9FE"),  # purple tint
         "In Progress":        PatternFill("solid", fgColor="CFFAFE"),  # cyan tint
         "Queued":             PatternFill("solid", fgColor="F8FAFC"),  # very light gray
     }
@@ -2452,6 +2485,7 @@ async def startup():
     await db.progress.create_index("run_id")
     await db.file_logs.create_index([("run_id", 1), ("filename", 1)])
     await db.file_logs.create_index([("user_id", 1), ("run_id", 1)])
+    await db.files.create_index([("user_id", 1), ("sha256", 1)])
     await db.duplicates.create_index("run_id")
     await db.raw_contacts.create_index("run_id")
     # Recover stale "processing" runs from server restarts
