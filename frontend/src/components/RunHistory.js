@@ -28,6 +28,25 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
     }
   };
 
+  const downloadLogXLSX = async (e, runId) => {
+    e.stopPropagation();
+    try {
+      const resp = await api.get(`/runs/${runId}/download/log`, { responseType: 'blob' });
+      const blob = new Blob([resp.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `processing_log_${runId.slice(0, 8)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast.success('Processing log downloaded');
+    } catch {
+      toast.error('Log download failed');
+    }
+  };
+
   const handleDelete = async () => {
     if (!confirmDelete) return;
     setDeleting(true);
@@ -110,6 +129,17 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
                 </div>
 
                 <div className="flex items-center gap-2">
+                  {/* Processing Log is always available (live status, even mid-run) */}
+                  {run.status !== 'uploading' && (
+                    <button
+                      onClick={(e) => downloadLogXLSX(e, run.id)}
+                      className="text-xs bg-transparent border border-sky-500/20 text-sky-400 hover:bg-sky-500/10 rounded-sm px-3 py-1 transition-colors inline-flex items-center gap-1"
+                      data-testid={`download-log-${run.id}`}
+                      title="Download Excel processing log (live status)"
+                    >
+                      <Download className="h-3 w-3" /> Log
+                    </button>
+                  )}
                   {run.status === 'completed' && (
                     <>
                       <button

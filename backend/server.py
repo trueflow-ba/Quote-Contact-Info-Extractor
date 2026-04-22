@@ -1215,6 +1215,84 @@ async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: s
         logger.error(f"Gemini text extraction failed for {filename}: {e}")
         return [], str(e)
 
+# =============================================================================
+# FILE PROCESSING LOG (one row per file; Excel-exportable)
+# =============================================================================
+FILE_TYPE_MAP = {
+    'pdf': 'PDF', 'docx': 'DOCX', 'doc': 'DOC', 'xlsx': 'XLSX', 'xls': 'XLS',
+    'jpg': 'Image/JPG', 'jpeg': 'Image/JPG', 'png': 'Image/PNG', 'webp': 'Image/WEBP',
+    'heic': 'Image/HEIC', 'heif': 'Image/HEIF', 'tiff': 'Image/TIFF', 'tif': 'Image/TIFF', 'bmp': 'Image/BMP',
+}
+
+async def log_file_queued(run_id: str, user_id: str, file_record: dict):
+    """Upsert a Queued row at the moment files are registered for a run."""
+    filename = file_record["original_filename"]
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    size_kb = round(file_record.get("size", 0) / 1024)
+    await db.file_logs.update_one(
+        {"run_id": run_id, "file_id": file_record["id"]},
+        {"$setOnInsert": {
+            "id": str(uuid.uuid4()),
+            "run_id": run_id, "user_id": user_id, "file_id": file_record["id"],
+            "filename": filename, "file_type": FILE_TYPE_MAP.get(ext, ext.upper() or "Unknown"),
+            "size_kb": size_kb, "csi": extract_csi_from_filename(filename),
+            "status": "Queued", "contacts_extracted": 0,
+            "processing_tool": "", "llm_model": "", "llm_provider": "",
+            "support_tools": "", "pages_sent": 0,
+            "started_at": "", "completed_at": "", "duration_sec": 0,
+            "missing_fields": "", "issue_reason": "", "retries": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True
+    )
+
+async def log_file_start(run_id: str, file_id: str):
+    """Mark a file as In Progress when its task begins."""
+    await db.file_logs.update_one(
+        {"run_id": run_id, "file_id": file_id},
+        {"$set": {"status": "In Progress", "started_at": datetime.now(timezone.utc).isoformat()}}
+    )
+
+async def log_file_finish(run_id: str, file_id: str, **fields):
+    """Mark a file complete with final status + metadata.
+    Expected fields: status, contacts_extracted, processing_tool, llm_model, llm_provider,
+                     support_tools, pages_sent, missing_fields, issue_reason, retries
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    # Compute duration from started_at if present
+    existing = await db.file_logs.find_one({"run_id": run_id, "file_id": file_id}, {"_id": 0, "started_at": 1})
+    duration_sec = 0
+    if existing and existing.get("started_at"):
+        try:
+            start_dt = datetime.fromisoformat(existing["started_at"].replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            duration_sec = round((end_dt - start_dt).total_seconds(), 1)
+        except Exception:
+            pass
+    update_doc = {"completed_at": now, "duration_sec": duration_sec}
+    update_doc.update({k: v for k, v in fields.items() if v is not None})
+    await db.file_logs.update_one(
+        {"run_id": run_id, "file_id": file_id},
+        {"$set": update_doc}
+    )
+
+async def enforce_log_retention(user_id: str, keep: int = 3):
+    """Keep file_logs for only the most-recent `keep` COMPLETED runs per user.
+    Runs in other statuses (processing/paused/uploaded/failed) are always preserved.
+    """
+    completed_runs = await db.runs.find(
+        {"user_id": user_id, "status": "completed"},
+        {"_id": 0, "id": 1, "completed_at": 1, "created_at": 1}
+    ).to_list(500)
+    # Sort newest → oldest by completed_at (fall back to created_at)
+    completed_runs.sort(key=lambda r: r.get("completed_at") or r.get("created_at") or "", reverse=True)
+    to_delete = [r["id"] for r in completed_runs[keep:]]
+    if to_delete:
+        res = await db.file_logs.delete_many({"user_id": user_id, "run_id": {"$in": to_delete}})
+        if res.deleted_count:
+            logger.info(f"Log retention: deleted {res.deleted_count} file_log rows from {len(to_delete)} old run(s) for user {user_id}")
+
+
 async def process_run(run_id: str, user_id: str):
     """Process PDFs with pause/resume/cancel support. State is persisted in MongoDB."""
     try:
@@ -1233,6 +1311,10 @@ async def process_run(run_id: str, user_id: str):
         if total_files == 0:
             await db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}})
             return
+
+        # Seed a Queued log row for every file so the log is populated immediately
+        for fr in all_files:
+            await log_file_queued(run_id, user_id, fr)
 
         # Load checkpoint: which files are already done
         prog = await db.progress.find_one({"run_id": run_id})
@@ -1254,7 +1336,13 @@ async def process_run(run_id: str, user_id: str):
         async def process_single_file(file_record):
             """Process a single file (PDF/DOCX/XLSX) using Gemini."""
             filename = file_record["original_filename"]
+            file_id = file_record["id"]
             contacts_out, errors_out = [], []
+            # Track provenance for the Excel log
+            processing_tool = ""
+            support_tools = []
+            pages_sent = 0
+            await log_file_start(run_id, file_id)
             try:
                 file_bytes = get_object(file_record["storage_path"])
                 gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
@@ -1265,14 +1353,21 @@ async def process_run(run_id: str, user_id: str):
                     text = None
                     if ext == 'docx':
                         text, _ = extract_text_from_docx(file_bytes, filename)
+                        if text:
+                            support_tools.append("python-docx")
                     contacts, gemini_error = [], None
                     if text:
+                        processing_tool = "Gemini Text (DOCX text path)"
                         contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
                     # Step 2: vision fallback only if ZERO contacts
                     if not contacts:
                         logger.info(f"DOC fallback to vision for {filename}")
                         images, conv_err = convert_doc_to_images(file_bytes, filename, f".{ext}")
                         if images:
+                            support_tools.append("LibreOffice")
+                            support_tools.append("poppler-utils")
+                            pages_sent = min(len(images), 8)
+                            processing_tool = "Gemini Vision (LibreOffice Fallback)"
                             contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
                         elif gemini_error is None:
                             gemini_error = conv_err or "LibreOffice conversion failed"
@@ -1280,13 +1375,20 @@ async def process_run(run_id: str, user_id: str):
                     text = None
                     if ext == 'xlsx':
                         text, _ = extract_text_from_xlsx(file_bytes, filename)
+                        if text:
+                            support_tools.append("openpyxl")
                     contacts, gemini_error = [], None
                     if text:
+                        processing_tool = "Gemini Text (XLSX text path)"
                         contacts, gemini_error = await extract_contacts_with_gemini_text(text, filename, gemini_key)
                     if not contacts:
                         logger.info(f"XLS fallback to vision for {filename}")
                         images, conv_err = convert_doc_to_images(file_bytes, filename, f".{ext}")
                         if images:
+                            support_tools.append("LibreOffice")
+                            support_tools.append("poppler-utils")
+                            pages_sent = min(len(images), 8)
+                            processing_tool = "Gemini Vision (LibreOffice Fallback)"
                             contacts, gemini_error = await extract_contacts_with_gemini_from_images(images, filename, gemini_key)
                         elif gemini_error is None:
                             gemini_error = conv_err or "LibreOffice conversion failed"
@@ -1294,47 +1396,101 @@ async def process_run(run_id: str, user_id: str):
                     # PDF path (default) + any other unknown extensions fall through to PDF pipeline
                     is_image = ext in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'tiff', 'tif', 'bmp')
                     if is_image:
+                        processing_tool = "Gemini Vision (Direct)"
+                        support_tools.append("PIL")
                         try:
                             from PIL import Image
-                            # Pillow needs pillow-heif for HEIC support (register opener if available)
                             if ext in ('heic', 'heif'):
                                 try:
                                     from pillow_heif import register_heif_opener
                                     register_heif_opener()
+                                    support_tools.append("pillow-heif")
                                 except ImportError:
                                     pass
                             img = Image.open(io.BytesIO(file_bytes))
                             if img.mode not in ('RGB', 'L'):
                                 img = img.convert('RGB')
+                            pages_sent = 1
                             contacts, gemini_error = await extract_contacts_with_gemini_from_images([img], filename, gemini_key)
                         except Exception as img_err:
                             logger.error(f"Image load failed for {filename}: {img_err}")
                             contacts, gemini_error = [], f"Could not load image: {img_err}"
                     else:
+                        support_tools.append("poppler-utils")
                         if len(file_bytes) > PDF_SIZE_THRESHOLD:
+                            support_tools.append("PDF Compression")
                             file_bytes = compress_pdf(file_bytes, filename)
-                        contacts, gemini_error = await extract_contacts_with_gemini(file_bytes, filename, gemini_key)
+                        processing_tool = "Gemini Vision (Direct)"
+                        # convert_from_bytes inside extract_contacts_with_gemini caps at 8 pages internally
+                        try:
+                            from pdf2image import convert_from_bytes
+                            pdf_imgs = convert_from_bytes(file_bytes, dpi=250, fmt="jpeg")
+                            pages_sent = min(len(pdf_imgs), 8)
+                            contacts, gemini_error = await extract_contacts_with_gemini_from_images(pdf_imgs, filename, gemini_key)
+                        except Exception as e:
+                            contacts, gemini_error = [], f"Could not convert PDF to images: {e}"
+
+                # Determine log status + missing-fields summary
+                log_status = "Success"
+                log_missing = ""
+                log_issue = ""
+                if gemini_error and not contacts:
+                    log_status = "Failure"
+                    log_issue = f"Gemini extraction failed: {gemini_error}"
+                elif not contacts:
+                    log_status = "No Contacts Found"
+                    log_issue = "Gemini returned 0 contacts — document may be blank or OCR-resistant"
 
                 if gemini_error and not contacts:
                     errors_out.append({"filename": filename, "reason": f"Gemini extraction failed: {gemini_error}", "missing_fields": "All fields"})
+                    await log_file_finish(run_id, file_id,
+                        status=log_status, contacts_extracted=0,
+                        processing_tool=processing_tool, llm_model="gemini-2.5-flash",
+                        llm_provider="Google (Emergent Key)",
+                        support_tools=", ".join(sorted(set(support_tools))),
+                        pages_sent=pages_sent, missing_fields="All fields", issue_reason=log_issue)
                     return contacts_out, errors_out, True
 
                 if not contacts:
                     errors_out.append({"filename": filename, "reason": "No contact information found by Gemini", "missing_fields": "All fields"})
 
+                # Accumulate missing-field summary across all extracted contacts
+                all_missing = set()
                 for contact in contacts:
-                    missing = [f.capitalize() for f in ["email", "phone", "city", "state", "contractor", "sub_contractor"] if not contact.get(f)]
-                    if missing and len(missing) >= 4:
-                        errors_out.append({"filename": filename, "reason": "Incomplete Gemini extraction - most fields missing", "missing_fields": ", ".join(missing)})
+                    missing = [f for f in ["email", "phone", "city", "state", "contractor", "sub_contractor", "address"] if not contact.get(f)]
+                    if len(missing) >= 4:
+                        errors_out.append({"filename": filename, "reason": "Incomplete Gemini extraction - most fields missing", "missing_fields": ", ".join(m.replace("_", " ").title() for m in missing)})
+                    all_missing.update(missing)
                     contact["source_filename"] = filename
                     contact["csi"] = extract_csi_from_filename(filename)
                     contacts_out.append(contact)
+
+                # Classify final status
+                if contacts_out:
+                    if all_missing:
+                        log_status = "Partial Success"
+                        log_issue = f"Contact(s) extracted but {len(all_missing)} field(s) were missing"
+                    log_missing = ", ".join(m.replace("_", " ").title() for m in sorted(all_missing))
+
+                await log_file_finish(run_id, file_id,
+                    status=log_status, contacts_extracted=len(contacts_out),
+                    processing_tool=processing_tool, llm_model="gemini-2.5-flash",
+                    llm_provider="Google (Emergent Key)",
+                    support_tools=", ".join(sorted(set(support_tools))),
+                    pages_sent=pages_sent, missing_fields=log_missing, issue_reason=log_issue)
 
                 return contacts_out, errors_out, bool(errors_out and not contacts_out)
 
             except Exception as e:
                 logger.error(f"Error processing {filename}: {e}")
                 errors_out.append({"filename": filename, "reason": f"Processing error: {str(e)}", "missing_fields": "All fields"})
+                await log_file_finish(run_id, file_id,
+                    status="Failure", contacts_extracted=0,
+                    processing_tool=processing_tool or "Unknown",
+                    llm_model="gemini-2.5-flash", llm_provider="Google (Emergent Key)",
+                    support_tools=", ".join(sorted(set(support_tools))),
+                    pages_sent=pages_sent, missing_fields="All fields",
+                    issue_reason=f"Processing error: {str(e)}")
                 return contacts_out, errors_out, True
 
         # --- Previous multi-step extraction (Claude/GPT text + vision) preserved but not invoked ---
@@ -1527,6 +1683,8 @@ async def process_run(run_id: str, user_id: str):
         await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "completed", "percentage": 100, "processed_files": total_files, "message": "Extraction complete!"}})
         # Clean up raw contacts
         await db.raw_contacts.delete_many({"run_id": run_id})
+        # Enforce log retention — keep only 3 most recent completed runs
+        await enforce_log_retention(user_id, keep=3)
         logger.info(f"Run {run_id} completed: {len(all_contacts)} contacts from {total_files} files")
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
@@ -1814,6 +1972,116 @@ async def download_errors_csv(run_id: str, request: Request):
     )
 
 # =============================================================================
+# FILE PROCESSING LOG — JSON view + XLSX download
+# =============================================================================
+LOG_COLUMNS = [
+    ("filename",          "Filename",            40),
+    ("file_type",         "File Type",           12),
+    ("size_kb",           "File Size (KB)",      12),
+    ("csi",               "CSI",                  6),
+    ("status",            "Status",              18),
+    ("contacts_extracted","Contacts Extracted",  14),
+    ("processing_tool",   "Processing Tool",     34),
+    ("llm_model",         "LLM Model",           18),
+    ("llm_provider",      "LLM Provider",        22),
+    ("support_tools",     "Support Tools",       34),
+    ("pages_sent",        "Pages Sent to LLM",   12),
+    ("started_at",        "Started At",          22),
+    ("completed_at",      "Completed At",        22),
+    ("duration_sec",      "Duration (sec)",      12),
+    ("missing_fields",    "Missing Fields",      30),
+    ("issue_reason",      "Issue / Error Reason",50),
+    ("retries",           "Retries",              8),
+]
+
+@api_router.get("/runs/{run_id}/log")
+async def get_run_log(run_id: str, request: Request):
+    """JSON view of the file-processing log for this run (live)."""
+    user = await get_current_user(request)
+    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(5000)
+    return rows
+
+@api_router.get("/runs/{run_id}/download/log")
+async def download_run_log_xlsx(run_id: str, request: Request):
+    """Download the file-processing log as a styled XLSX workbook."""
+    user = await get_current_user(request)
+    # Verify run belongs to user
+    run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0, "created_at": 1})
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(5000)
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Processing Log"
+
+    # Header row
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", fgColor="1E293B")
+    for idx, (_, label, width) in enumerate(LOG_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=idx, value=label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(LOG_COLUMNS))}1"
+
+    # Status color map
+    status_fills = {
+        "Success":            PatternFill("solid", fgColor="D1FAE5"),  # green tint
+        "Partial Success":    PatternFill("solid", fgColor="FEF3C7"),  # yellow tint
+        "No Contacts Found":  PatternFill("solid", fgColor="E0E7FF"),  # blue tint
+        "Failure":            PatternFill("solid", fgColor="FEE2E2"),  # red tint
+        "Skipped":            PatternFill("solid", fgColor="F1F5F9"),  # gray tint
+        "In Progress":        PatternFill("solid", fgColor="CFFAFE"),  # cyan tint
+        "Queued":             PatternFill("solid", fgColor="F8FAFC"),  # very light gray
+    }
+
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, (key, _, _) in enumerate(LOG_COLUMNS, start=1):
+            val = row.get(key, "")
+            ws.cell(row=r_idx, column=c_idx, value=val)
+        # Color the Status column (5th)
+        status_val = row.get("status", "")
+        fill = status_fills.get(status_val)
+        if fill:
+            ws.cell(row=r_idx, column=5).fill = fill
+            ws.cell(row=r_idx, column=5).font = Font(bold=True)
+
+    # Summary block at bottom
+    summary_row = len(rows) + 3
+    status_counts = {}
+    for row in rows:
+        s = row.get("status", "Unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    ws.cell(row=summary_row, column=1, value="SUMMARY").font = Font(bold=True, size=12)
+    summary_row += 1
+    ws.cell(row=summary_row, column=1, value="Total Files").font = Font(bold=True)
+    ws.cell(row=summary_row, column=2, value=len(rows))
+    for status, count in sorted(status_counts.items()):
+        summary_row += 1
+        ws.cell(row=summary_row, column=1, value=status).font = Font(bold=True)
+        ws.cell(row=summary_row, column=2, value=count)
+        fill = status_fills.get(status)
+        if fill:
+            ws.cell(row=summary_row, column=1).fill = fill
+
+    # Stream out
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=processing_log_{run_id[:8]}.xlsx"}
+    )
+
+# =============================================================================
 # DELETE ROUTES
 # =============================================================================
 @api_router.delete("/runs/{run_id}")
@@ -1826,6 +2094,7 @@ async def delete_run(run_id: str, request: Request):
     await db.contacts.delete_many({"run_id": run_id, "user_id": user["_id"]})
     await db.processing_errors.delete_many({"run_id": run_id, "user_id": user["_id"]})
     await db.duplicates.delete_many({"run_id": run_id, "user_id": user["_id"]})
+    await db.file_logs.delete_many({"run_id": run_id, "user_id": user["_id"]})
     await db.progress.delete_many({"run_id": run_id})
     await db.files.update_many({"run_id": run_id, "user_id": user["_id"]}, {"$set": {"is_deleted": True}})
     return {"message": "Run deleted"}
@@ -1839,6 +2108,7 @@ async def delete_all_data(request: Request):
     results["contacts"] = (await db.contacts.delete_many({"user_id": uid})).deleted_count
     results["errors"] = (await db.processing_errors.delete_many({"user_id": uid})).deleted_count
     results["duplicates"] = (await db.duplicates.delete_many({"user_id": uid})).deleted_count
+    results["file_logs"] = (await db.file_logs.delete_many({"user_id": uid})).deleted_count
     results["files"] = (await db.files.update_many({"user_id": uid}, {"$set": {"is_deleted": True}})).modified_count
     run_ids = [r["run_id"] async for r in db.progress.find({})]
     await db.progress.delete_many({})
@@ -1856,6 +2126,13 @@ async def startup():
     except subprocess.CalledProcessError:
         logger.warning("poppler-utils not found, installing...")
         subprocess.run(["apt-get", "install", "-y", "poppler-utils"], capture_output=True)
+    # Ensure LibreOffice is installed (needed for DOCX/XLSX vision fallback)
+    try:
+        subprocess.run(["which", "libreoffice"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        logger.warning("libreoffice not found, installing in background...")
+        subprocess.Popen(["apt-get", "install", "-y", "--no-install-recommends", "libreoffice"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         init_storage()
         logger.info("Object storage initialized")
@@ -1868,6 +2145,8 @@ async def startup():
     await db.processing_errors.create_index("run_id")
     await db.files.create_index("run_id")
     await db.progress.create_index("run_id")
+    await db.file_logs.create_index([("run_id", 1), ("filename", 1)])
+    await db.file_logs.create_index([("user_id", 1), ("run_id", 1)])
     await db.duplicates.create_index("run_id")
     await db.raw_contacts.create_index("run_id")
     # Recover stale "processing" runs from server restarts
