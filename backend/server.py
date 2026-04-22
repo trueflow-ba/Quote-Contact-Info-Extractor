@@ -1445,6 +1445,7 @@ async def log_file_queued(run_id: str, user_id: str, file_record: dict):
             "run_id": run_id, "user_id": user_id, "file_id": file_record["id"],
             "filename": filename, "file_type": FILE_TYPE_MAP.get(ext, ext.upper() or "Unknown"),
             "size_kb": size_kb, "csi": extract_csi_from_filename(filename),
+            "sha256": file_record.get("sha256", ""),
             "status": "Queued", "contacts_extracted": 0,
             "processing_tool": "", "llm_model": "", "llm_provider": "",
             "support_tools": "", "pages_sent": 0,
@@ -2315,6 +2316,7 @@ LOG_COLUMNS = [
     ("filename",          "Filename",            40),
     ("file_type",         "File Type",           12),
     ("size_kb",           "File Size (KB)",      12),
+    ("sha256",            "SHA-256 (content hash)", 18),
     ("csi",               "CSI",                  6),
     ("status",            "Status",              18),
     ("contacts_extracted","Contacts Extracted",  14),
@@ -2418,6 +2420,104 @@ async def download_run_log_xlsx(run_id: str, request: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename=processing_log_{run_id[:8]}.xlsx"}
     )
+
+# =============================================================================
+# SKIP REGISTRY — portable cross-run dedup list. Export before the container
+# shuts down, re-import after rebuild so the system still knows which files
+# have already been analyzed.
+# =============================================================================
+@api_router.get("/skip-registry/export")
+async def export_skip_registry(request: Request):
+    """Download a CSV of every file this user has processed, keyed by sha256."""
+    user = await get_current_user(request)
+    # Aggregate: unique hashes across all file records, joined with file_logs
+    files_cursor = db.files.find(
+        {"user_id": user["_id"], "sha256": {"$exists": True, "$ne": ""}},
+        {"_id": 0, "sha256": 1, "original_filename": 1, "run_id": 1, "created_at": 1}
+    )
+    seen_hashes = set()
+    rows = []
+    async for f in files_cursor:
+        h = f.get("sha256")
+        if not h or h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        log = await db.file_logs.find_one(
+            {"user_id": user["_id"], "sha256": h},
+            {"_id": 0, "status": 1, "contacts_extracted": 1, "completed_at": 1}
+        )
+        rows.append({
+            "filename": f.get("original_filename", ""),
+            "sha256": h,
+            "processed_at": (log or {}).get("completed_at") or f.get("created_at", ""),
+            "run_id": f.get("run_id", ""),
+            "contacts_count": (log or {}).get("contacts_extracted", 0),
+            "status": (log or {}).get("status", "Success"),
+        })
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["filename", "sha256", "processed_at", "run_id", "contacts_count", "status"])
+    for r in rows:
+        writer.writerow([r["filename"], r["sha256"], r["processed_at"], r["run_id"], r["contacts_count"], r["status"]])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=skip_registry_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"}
+    )
+
+
+@api_router.post("/skip-registry/import")
+async def import_skip_registry(request: Request, file: UploadFile = File(...)):
+    """Re-populate the dedup registry from a previously exported CSV.
+    Creates minimal `files` records (is_deleted=True) so future uploads with
+    matching sha256 are skipped. Safe to re-import multiple times (idempotent on sha256).
+    """
+    user = await get_current_user(request)
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Expected a CSV file exported from /skip-registry/export")
+    data = await file.read()
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unreadable file")
+    reader = csv.DictReader(io.StringIO(text))
+    required_cols = {"filename", "sha256"}
+    if not required_cols.issubset(set(reader.fieldnames or [])):
+        raise HTTPException(status_code=400, detail=f"CSV missing required columns: {required_cols - set(reader.fieldnames or [])}")
+    imported_run_id = f"imported-{uuid.uuid4()}"
+    imported = 0
+    skipped = 0
+    for row in reader:
+        sha = (row.get("sha256") or "").strip()
+        fname = (row.get("filename") or "").strip()
+        if not sha or len(sha) != 64:
+            skipped += 1
+            continue
+        # Skip if we already have this hash for this user (idempotent)
+        existing = await db.files.find_one({"user_id": user["_id"], "sha256": sha}, {"_id": 0, "id": 1})
+        if existing:
+            skipped += 1
+            continue
+        await db.files.insert_one({
+            "id": str(uuid.uuid4()),
+            "run_id": row.get("run_id") or imported_run_id,
+            "user_id": user["_id"],
+            "storage_path": "",  # intentionally empty — file isn't in object storage
+            "original_filename": fname,
+            "content_type": "",
+            "size": 0,
+            "sha256": sha,
+            "is_deleted": True,  # marker: hash-only record, no object to retrieve
+            "imported_from_registry": True,
+            "imported_processed_at": row.get("processed_at") or "",
+            "imported_contacts_count": int(row.get("contacts_count") or 0),
+            "imported_status": row.get("status") or "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        imported += 1
+    return {"imported": imported, "skipped_already_known": skipped, "total_in_file": imported + skipped}
 
 # =============================================================================
 # DELETE ROUTES

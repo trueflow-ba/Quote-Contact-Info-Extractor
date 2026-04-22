@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { toast } from 'sonner';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
-import { Save, Loader2, Globe, Trash2, AlertTriangle, Info } from 'lucide-react';
+import { Save, Loader2, Globe, Trash2, AlertTriangle, Info, Download, Upload, Database } from 'lucide-react';
 import api from '@/lib/api';
 import Header from '@/components/Header';
 
@@ -49,6 +49,47 @@ export default function SettingsPage() {
       toast.error('Failed to delete data');
     }
     setDeletingAll(false);
+  };
+
+  const [importingRegistry, setImportingRegistry] = useState(false);
+  const [exportingRegistry, setExportingRegistry] = useState(false);
+  const importFileRef = useRef(null);
+
+  const handleExportRegistry = async () => {
+    setExportingRegistry(true);
+    try {
+      const resp = await api.get('/skip-registry/export', { responseType: 'blob' });
+      const blob = new Blob([resp.data], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const dateStr = new Date().toISOString().slice(0, 10);
+      a.download = `skip_registry_${dateStr}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast.success('Skip registry exported');
+    } catch {
+      toast.error('Failed to export skip registry');
+    }
+    setExportingRegistry(false);
+  };
+
+  const handleImportRegistry = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportingRegistry(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const { data } = await api.post('/skip-registry/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+      toast.success(`Imported ${data.imported} new hash(es); ${data.skipped_already_known} already known.`);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to import');
+    }
+    setImportingRegistry(false);
+    if (importFileRef.current) importFileRef.current.value = '';
   };
 
   const modelLabels = { 'claude-sonnet': 'Claude Sonnet', 'claude-haiku': 'Claude Haiku', 'gpt-4o': 'GPT-4o' };
@@ -117,6 +158,47 @@ export default function SettingsPage() {
           {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
           Save Settings
         </button>
+
+        {/* Skip Registry — portable dedup list */}
+        <section className="bg-[#111827] border border-sky-500/20 rounded-sm p-6 space-y-4 mt-12">
+          <div className="flex items-center gap-2 mb-2">
+            <Database className="h-4 w-4 text-sky-400" strokeWidth={1.5} />
+            <h2 className="text-sm font-semibold text-sky-400 uppercase tracking-wider">Skip Registry (Cross-Run Dedup)</h2>
+          </div>
+          <p className="text-xs text-slate-500">
+            Export a compact CSV listing every file you've analyzed (SHA-256 content hash + filename). Re-import after a container rebuild
+            so the app still recognizes already-processed files and skips them — saving LLM cost + time on your next run.
+          </p>
+          <div className="flex items-start gap-3 bg-sky-500/5 border border-sky-500/10 rounded-sm p-3">
+            <Info className="h-4 w-4 text-sky-400 shrink-0 mt-0.5" strokeWidth={1.5} />
+            <div className="text-xs text-slate-400 space-y-1">
+              <p><strong className="text-slate-300">When to export:</strong> before planned environment shutdown / end of day.</p>
+              <p><strong className="text-slate-300">When to import:</strong> first thing after the app restarts, before uploading new batches.</p>
+              <p><strong className="text-slate-300">Safe to import repeatedly</strong> — duplicate hashes are silently skipped.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleExportRegistry}
+              disabled={exportingRegistry}
+              className="bg-sky-500/10 border border-sky-500/20 text-sky-300 hover:bg-sky-500 hover:text-white rounded-sm px-5 py-2 text-sm font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-50"
+              data-testid="export-skip-registry-button"
+            >
+              {exportingRegistry ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              Export Skip Registry
+            </button>
+            <button
+              onClick={() => importFileRef.current?.click()}
+              disabled={importingRegistry}
+              className="bg-transparent border border-sky-500/20 text-sky-300 hover:bg-sky-500/10 rounded-sm px-5 py-2 text-sm font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-50"
+              data-testid="import-skip-registry-button"
+            >
+              {importingRegistry ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              Import Skip Registry
+            </button>
+            <input ref={importFileRef} type="file" accept=".csv" onChange={handleImportRegistry} className="hidden" data-testid="import-skip-registry-input" />
+          </div>
+        </section>
 
         {/* Data Management */}
         <section className="bg-[#111827] border border-red-500/20 rounded-sm p-6 space-y-4 mt-12">
