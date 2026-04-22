@@ -2449,11 +2449,22 @@ async def export_skip_registry(request: Request):
     a container rebuild.
     """
     user = await get_current_user(request)
+
+    # Pre-count contacts per (run_id, source_filename) so we can attach counts
+    # to files that predate the file_logs collection. Single aggregation query.
+    contacts_counts = {}  # (run_id, filename) -> count
+    agg = db.contacts.aggregate([
+        {"$match": {"user_id": user["_id"]}},
+        {"$group": {"_id": {"run_id": "$run_id", "fn": "$source_filename"}, "n": {"$sum": 1}}}
+    ])
+    async for row in agg:
+        k = (row["_id"].get("run_id", ""), row["_id"].get("fn", ""))
+        contacts_counts[k] = row["n"]
+
     files_cursor = db.files.find(
         {"user_id": user["_id"]},
         {"_id": 0, "sha256": 1, "original_filename": 1, "size": 1, "run_id": 1, "created_at": 1}
     )
-    # Dedupe by: sha256 if present; otherwise by (filename, size)
     seen_hashes = set()
     seen_legacy = set()
     rows = []
@@ -2461,16 +2472,16 @@ async def export_skip_registry(request: Request):
         h = f.get("sha256") or ""
         fname = f.get("original_filename", "")
         size = f.get("size", 0)
-        dedup_key = h if h else f"LEGACY::{fname}::{size}"
-        if h and h in seen_hashes:
-            continue
-        if not h:
-            if dedup_key in seen_legacy:
+        if h:
+            if h in seen_hashes:
                 continue
-            seen_legacy.add(dedup_key)
-        else:
             seen_hashes.add(h)
-        # Attach status + contacts_count from file_logs if present; otherwise fall back
+        else:
+            key = f"LEGACY::{fname}::{size}"
+            if key in seen_legacy:
+                continue
+            seen_legacy.add(key)
+        # Prefer log row for status, fall back to aggregated contacts count
         log = await db.file_logs.find_one(
             {"user_id": user["_id"], "run_id": f.get("run_id"), "filename": fname},
             {"_id": 0, "status": 1, "contacts_extracted": 1, "completed_at": 1}
@@ -2480,14 +2491,20 @@ async def export_skip_registry(request: Request):
                 {"user_id": user["_id"], "sha256": h},
                 {"_id": 0, "status": 1, "contacts_extracted": 1, "completed_at": 1}
             )
+        # Backfill contacts_count from contacts collection when log is missing/empty
+        cc = (log or {}).get("contacts_extracted", 0)
+        if not cc:
+            cc = contacts_counts.get((f.get("run_id", ""), fname), 0)
+        # Backfill status similarly
+        status = (log or {}).get("status") or ("Success" if cc > 0 else "Processed")
         rows.append({
             "filename": fname,
             "sha256": h,
             "size": size,
             "processed_at": (log or {}).get("completed_at") or f.get("created_at", ""),
             "run_id": f.get("run_id", ""),
-            "contacts_count": (log or {}).get("contacts_extracted", 0),
-            "status": (log or {}).get("status", "Processed"),
+            "contacts_count": cc,
+            "status": status,
         })
 
     output = io.StringIO()
