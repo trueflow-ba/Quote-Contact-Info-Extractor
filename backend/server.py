@@ -522,7 +522,7 @@ CHUNK_UPLOAD_DIR = "/tmp/chunked_uploads"
 os.makedirs(CHUNK_UPLOAD_DIR, exist_ok=True)
 
 # Accepted extensions for inputs (PDF-style docs + images; ZIP is handled separately)
-SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls',
+SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls', '.txt',
                         '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp')
 
 
@@ -592,6 +592,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
                 ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                           'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
+                          'txt': 'text/plain',
                           'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp',
                           'heic': 'image/heic', 'heif': 'image/heif', 'tiff': 'image/tiff', 'tif': 'image/tiff', 'bmp': 'image/bmp'}
                 content_type = ct_map.get(ext, 'application/octet-stream')
@@ -1428,7 +1429,7 @@ async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: s
 # FILE PROCESSING LOG (one row per file; Excel-exportable)
 # =============================================================================
 FILE_TYPE_MAP = {
-    'pdf': 'PDF', 'docx': 'DOCX', 'doc': 'DOC', 'xlsx': 'XLSX', 'xls': 'XLS',
+    'pdf': 'PDF', 'docx': 'DOCX', 'doc': 'DOC', 'xlsx': 'XLSX', 'xls': 'XLS', 'txt': 'TXT',
     'jpg': 'Image/JPG', 'jpeg': 'Image/JPG', 'png': 'Image/PNG', 'webp': 'Image/WEBP',
     'heic': 'Image/HEIC', 'heif': 'Image/HEIF', 'tiff': 'Image/TIFF', 'tif': 'Image/TIFF', 'bmp': 'Image/BMP',
 }
@@ -1620,7 +1621,22 @@ async def process_run(run_id: str, user_id: str):
                 gemini_key = os.environ.get("EMERGENT_LLM_KEY", "")
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
 
-                if ext in ('docx', 'doc'):
+                if ext == 'txt':
+                    # Plain text → decode → Gemini text path (no vision fallback needed)
+                    contacts, gemini_error = [], None
+                    text = None
+                    try:
+                        text = file_bytes.decode('utf-8', errors='replace').strip()
+                    except Exception as decode_err:
+                        gemini_error = f"Could not decode TXT: {decode_err}"
+                    if text:
+                        processing_tool = "Gemini Text (TXT)"
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
+                    elif not gemini_error:
+                        gemini_error = "TXT file was empty"
+                elif ext in ('docx', 'doc'):
                     # Step 1: text extraction via python-docx (only for .docx)
                     text = None
                     if ext == 'docx':

@@ -4,7 +4,7 @@ import { Upload, X, FileText, Archive } from 'lucide-react';
 export default function UploadZone({ files, setFiles }) {
   const inputRef = useRef(null);
 
-  const ACCEPTED_EXTENSIONS = ['.pdf', '.zip', '.docx', '.doc', '.xlsx', '.xls',
+  const ACCEPTED_EXTENSIONS = ['.pdf', '.zip', '.docx', '.doc', '.xlsx', '.xls', '.txt',
     '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp'];
   const isAccepted = (name) => {
     const n = (name || '').toLowerCase();
@@ -49,7 +49,7 @@ export default function UploadZone({ files, setFiles }) {
           ref={inputRef}
           type="file"
           multiple
-          accept=".pdf,.zip,.docx,.doc,.xlsx,.xls,.jpg,.jpeg,.png,.webp,.heic,.heif,.tiff,.tif,.bmp"
+          accept=".pdf,.zip,.docx,.doc,.xlsx,.xls,.txt,.jpg,.jpeg,.png,.webp,.heic,.heif,.tiff,.tif,.bmp"
           onChange={handleSelect}
           className="hidden"
           data-testid="file-upload-input"
