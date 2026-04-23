@@ -409,6 +409,70 @@ async def get_storage_usage(request: Request):
         "over_limit": total_bytes > max_mb * 1024 * 1024,
     }
 
+@api_router.get("/admin/disk-usage")
+async def get_disk_usage(request: Request):
+    """Container disk usage (where uploads / temp conversions / logs live)
+    so admins can see when the pod is approaching full. Also reports size of
+    staging dir for chunked uploads, which fills first if extractions fail."""
+    await require_admin(request)
+    import shutil
+    mounts = []
+    for path, label in [("/app", "App mount (/app)"), ("/", "Root (/)"), ("/tmp", "Temp (/tmp)")]:
+        try:
+            total, used, free = shutil.disk_usage(path)
+            pct = round(used / total * 100, 1) if total else 0
+            mounts.append({
+                "path": path, "label": label,
+                "total_gb": round(total / (1024**3), 2),
+                "used_gb": round(used / (1024**3), 2),
+                "free_gb": round(free / (1024**3), 2),
+                "percent_used": pct,
+            })
+        except Exception as e:
+            mounts.append({"path": path, "label": label, "error": str(e)})
+    # Staging dir size
+    staging_bytes = 0
+    try:
+        for root, _dirs, files in os.walk(CHUNK_UPLOAD_DIR):
+            for f in files:
+                try:
+                    staging_bytes += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return {
+        "mounts": mounts,
+        "chunked_upload_staging_mb": round(staging_bytes / (1024 * 1024), 2),
+        "chunked_upload_staging_path": CHUNK_UPLOAD_DIR,
+    }
+
+
+@api_router.post("/admin/disk-usage/clear-staging")
+async def clear_staging(request: Request):
+    """Clear the chunked-upload staging dir (safe to run any time — stale chunks
+    only). Useful when disk utilization is climbing and no uploads are in flight.
+    """
+    await require_admin(request)
+    import shutil
+    freed = 0
+    try:
+        for name in os.listdir(CHUNK_UPLOAD_DIR):
+            p = os.path.join(CHUNK_UPLOAD_DIR, name)
+            try:
+                if os.path.isdir(p):
+                    freed += sum(os.path.getsize(os.path.join(p, f)) for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
+                    shutil.rmtree(p, ignore_errors=True)
+                elif os.path.isfile(p):
+                    freed += os.path.getsize(p)
+                    os.remove(p)
+            except OSError:
+                pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {e}")
+    return {"message": "Staging dir cleared", "freed_mb": round(freed / (1024*1024), 2)}
+
+
 @api_router.post("/admin/storage/cleanup")
 async def trigger_storage_cleanup(request: Request):
     await require_admin(request)
@@ -1576,21 +1640,51 @@ async def log_file_finish(run_id: str, file_id: str, **fields):
         {"$set": update_doc}
     )
 
-async def enforce_log_retention(user_id: str, keep: int = 3):
-    """Keep file_logs for only the most-recent `keep` COMPLETED runs per user.
-    Runs in other statuses (processing/paused/uploaded/failed) are always preserved.
+async def enforce_log_retention(user_id: str, keep: int = 0):
+    """Log retention is DISABLED (keep=0 means keep all logs forever).
+    Kept as a no-op for backward compatibility; previously pruned old file_logs.
+    Disk usage is now surfaced to admins via /api/admin/disk-usage instead.
     """
-    completed_runs = await db.runs.find(
-        {"user_id": user_id, "status": "completed"},
-        {"_id": 0, "id": 1, "completed_at": 1, "created_at": 1}
-    ).to_list(500)
-    # Sort newest → oldest by completed_at (fall back to created_at)
-    completed_runs.sort(key=lambda r: r.get("completed_at") or r.get("created_at") or "", reverse=True)
-    to_delete = [r["id"] for r in completed_runs[keep:]]
-    if to_delete:
-        res = await db.file_logs.delete_many({"user_id": user_id, "run_id": {"$in": to_delete}})
-        if res.deleted_count:
-            logger.info(f"Log retention: deleted {res.deleted_count} file_log rows from {len(to_delete)} old run(s) for user {user_id}")
+    return
+
+
+async def recompute_run_stats(run_id: str, user_id: str):
+    """Self-healing stats: recompute run.stats from live collection counts.
+    Call from every GET endpoint that returns a run so stats never drift from reality.
+
+    Formula:
+      total_pdfs   = files.count({run_id}) (all, including is_deleted=True — those
+                      are historical, not gone from the run)
+      errors       = processing_errors.count({run_id})
+      duplicates_removed = duplicates.count({run_id})
+      net_new      = contacts.count({run_id})
+      processed    = total_pdfs - errors   (clamped to >= 0)
+      contacts_extracted / excluded_* / cross_run_duplicates are preserved if
+      present in the existing stats (they're computed during the run only).
+    """
+    run = await db.runs.find_one({"id": run_id, "user_id": user_id}, {"_id": 0, "stats": 1})
+    if not run:
+        return
+    existing = run.get("stats") or {}
+    total_pdfs = await db.files.count_documents({"run_id": run_id, "user_id": user_id})
+    errors = await db.processing_errors.count_documents({"run_id": run_id, "user_id": user_id})
+    dupes = await db.duplicates.count_documents({"run_id": run_id, "user_id": user_id})
+    contacts = await db.contacts.count_documents({"run_id": run_id, "user_id": user_id})
+    processed = max(0, total_pdfs - errors)
+    stats = {
+        **existing,
+        "total_pdfs": total_pdfs,
+        "processed": processed,
+        "errors": errors,
+        "duplicates_removed": dupes,
+        "net_new": contacts,
+    }
+    # contacts_extracted = total Gemini hits before filtering. If we don't have
+    # a stored value, fall back to (contacts + duplicates + excluded_no_contact + excluded_internal)
+    if not stats.get("contacts_extracted"):
+        stats["contacts_extracted"] = contacts + dupes + int(existing.get("excluded_no_contact", 0)) + int(existing.get("excluded_internal", 0))
+    await db.runs.update_one({"id": run_id, "user_id": user_id}, {"$set": {"stats": stats}})
+    return stats
 
 
 async def process_run(run_id: str, user_id: str):
@@ -2165,9 +2259,13 @@ async def process_run(run_id: str, user_id: str):
                              "created_at": datetime.now(timezone.utc).isoformat()} for c in all_contacts]
             await db.contacts.insert_many(contact_docs)
 
+        # Authoritative file count from the files collection (not the local `total_files`
+        # which may be smaller if files were cleaned up from storage mid-run).
+        authoritative_total = await db.files.count_documents({"run_id": run_id, "user_id": user_id})
         error_count = await db.processing_errors.count_documents({"run_id": run_id})
         stats = {
-            "total_pdfs": total_files, "processed": total_files - error_count,
+            "total_pdfs": authoritative_total,
+            "processed": max(0, authoritative_total - error_count),
             "errors": error_count, "contacts_extracted": total_extracted,
             "duplicates_removed": duplicates_removed + cross_run_dupes,
             "cross_run_duplicates": cross_run_dupes,
@@ -2180,12 +2278,10 @@ async def process_run(run_id: str, user_id: str):
             "auto_paused_reason": "",
         }
         await db.runs.update_one({"id": run_id}, {"$set": {"status": "completed", "stats": stats, "completed_at": datetime.now(timezone.utc).isoformat()}})
-        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "completed", "percentage": 100, "processed_files": total_files, "message": "Extraction complete!"}})
+        await db.progress.update_one({"run_id": run_id}, {"$set": {"status": "completed", "percentage": 100, "processed_files": authoritative_total, "message": "Extraction complete!"}})
         # Clean up raw contacts
         await db.raw_contacts.delete_many({"run_id": run_id})
-        # Enforce log retention — keep only 3 most recent completed runs
-        await enforce_log_retention(user_id, keep=3)
-        logger.info(f"Run {run_id} completed: {len(all_contacts)} contacts from {total_files} files")
+        logger.info(f"Run {run_id} completed: {len(all_contacts)} contacts from {authoritative_total} files")
     except Exception as e:
         logger.error(f"Run {run_id} failed: {e}")
         await db.runs.update_one({"id": run_id}, {"$set": {"status": "failed"}})
@@ -2285,6 +2381,12 @@ async def get_progress(run_id: str, request: Request):
 async def get_runs(request: Request):
     user = await get_current_user(request)
     runs = await db.runs.find({"user_id": user["_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    # Self-heal stats on read for any completed run (cheap, ~4 counts per run)
+    for r in runs:
+        if r.get("status") == "completed":
+            fresh = await recompute_run_stats(r["id"], user["_id"])
+            if fresh:
+                r["stats"] = fresh
     return runs
 
 @api_router.get("/runs/{run_id}")
@@ -2293,6 +2395,10 @@ async def get_run(run_id: str, request: Request):
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.get("status") == "completed":
+        fresh = await recompute_run_stats(run_id, user["_id"])
+        if fresh:
+            run["stats"] = fresh
     return run
 
 @api_router.get("/runs/{run_id}/contacts")
@@ -2560,20 +2666,131 @@ LOG_COLUMNS = [
 
 @api_router.get("/runs/{run_id}/log")
 async def get_run_log(run_id: str, request: Request):
-    """JSON view of the file-processing log for this run (live)."""
+    """JSON view of the file-processing log for this run (live). Falls back
+    to a synthesized log from files+contacts+errors if file_logs is empty."""
     user = await get_current_user(request)
-    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(5000)
-    return rows
+    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(50000)
+    if rows:
+        return rows
+    # Synthesize (mirrors the XLSX fallback)
+    files = await db.files.find({"run_id": run_id, "user_id": user["_id"]},
+                                 {"_id": 0, "original_filename": 1, "size": 1, "sha256": 1, "created_at": 1}
+                                ).sort("original_filename", 1).to_list(50000)
+    contacts_per_file = {}
+    async for row in db.contacts.aggregate([
+        {"$match": {"run_id": run_id, "user_id": user["_id"]}},
+        {"$group": {"_id": "$source_filename", "n": {"$sum": 1}}}
+    ]):
+        contacts_per_file[row.get("_id", "")] = row.get("n", 0)
+    errors_by_file = {}
+    async for e in db.processing_errors.find(
+        {"run_id": run_id, "user_id": user["_id"]},
+        {"_id": 0, "filename": 1, "reason": 1, "missing_fields": 1}
+    ):
+        errors_by_file[e.get("filename", "")] = e
+    out = []
+    for f in files:
+        fname = f.get("original_filename", "")
+        ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+        contacts_n = contacts_per_file.get(fname, 0)
+        err = errors_by_file.get(fname)
+        if err:
+            status, issue, missing = "Failure", err.get("reason", ""), err.get("missing_fields", "")
+        elif contacts_n > 0:
+            status, issue, missing = "Success", "", ""
+        else:
+            status, issue, missing = "No Contacts Found", "No contacts returned (log row pruned — reconstructed)", ""
+        out.append({
+            "filename": fname, "file_type": FILE_TYPE_MAP.get(ext, ext.upper() or "Unknown"),
+            "size_kb": round(f.get("size", 0) / 1024), "sha256": f.get("sha256", ""),
+            "csi": extract_csi_from_filename(fname),
+            "status": status, "contacts_extracted": contacts_n,
+            "processing_tool": "(retention: log row pruned — reconstructed)",
+            "llm_model": "gemini-2.5-flash", "llm_provider": "Google (Emergent Key)",
+            "support_tools": "", "pages_sent": 0,
+            "started_at": "", "completed_at": f.get("created_at", ""),
+            "duration_sec": 0, "missing_fields": missing, "issue_reason": issue, "retries": 0,
+        })
+    return out
 
 @api_router.get("/runs/{run_id}/download/log")
 async def download_run_log_xlsx(run_id: str, request: Request):
-    """Download the file-processing log as a styled XLSX workbook."""
+    """Download the file-processing log as a styled XLSX workbook.
+    If file_logs rows don't exist for this run (e.g., older runs predating the
+    log, or legacy data), synthesize rows on the fly from files + contacts +
+    processing_errors so the download always reflects the true status."""
     user = await get_current_user(request)
     # Verify run belongs to user
     run = await db.runs.find_one({"id": run_id, "user_id": user["_id"]}, {"_id": 0, "created_at": 1})
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(5000)
+    rows = await db.file_logs.find({"run_id": run_id, "user_id": user["_id"]}, {"_id": 0}).sort("filename", 1).to_list(50000)
+
+    # Fallback synthesis — when file_logs is empty but the run has data
+    if not rows:
+        # Pull files for this run
+        files = await db.files.find({"run_id": run_id, "user_id": user["_id"]},
+                                     {"_id": 0, "original_filename": 1, "size": 1, "sha256": 1, "created_at": 1}
+                                    ).sort("original_filename", 1).to_list(50000)
+        # Contacts by filename
+        contacts_per_file = {}
+        async for row in db.contacts.aggregate([
+            {"$match": {"run_id": run_id, "user_id": user["_id"]}},
+            {"$group": {"_id": "$source_filename", "n": {"$sum": 1}}}
+        ]):
+            contacts_per_file[row.get("_id", "")] = row.get("n", 0)
+        # Errors by filename
+        errors_by_file = {}
+        async for e in db.processing_errors.find(
+            {"run_id": run_id, "user_id": user["_id"]},
+            {"_id": 0, "filename": 1, "reason": 1, "missing_fields": 1}
+        ):
+            errors_by_file[e.get("filename", "")] = e
+        # Duplicates by filename
+        dupes_per_file = {}
+        async for row in db.duplicates.aggregate([
+            {"$match": {"run_id": run_id, "user_id": user["_id"]}},
+            {"$group": {"_id": "$source_filename", "n": {"$sum": 1}}}
+        ]):
+            dupes_per_file[row.get("_id", "")] = row.get("n", 0)
+
+        for f in files:
+            fname = f.get("original_filename", "")
+            ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+            contacts_n = contacts_per_file.get(fname, 0)
+            dupes_n = dupes_per_file.get(fname, 0)
+            err = errors_by_file.get(fname)
+            if err:
+                status = "Failure"
+                issue = err.get("reason", "")
+                missing = err.get("missing_fields", "")
+            elif contacts_n > 0:
+                status = "Success"; issue = ""; missing = ""
+            elif dupes_n > 0:
+                status = "Success"; issue = f"Produced {dupes_n} duplicate contact(s) that were merged into prior rows."; missing = ""
+            else:
+                status = "No Contacts Found"
+                issue = "No contacts returned (reason not logged — file_log row missing)"
+                missing = ""
+            rows.append({
+                "filename": fname,
+                "file_type": FILE_TYPE_MAP.get(ext, ext.upper() or "Unknown"),
+                "size_kb": round(f.get("size", 0) / 1024),
+                "sha256": f.get("sha256", ""),
+                "csi": extract_csi_from_filename(fname),
+                "status": status,
+                "contacts_extracted": contacts_n,
+                "processing_tool": "(retention: log row pruned — reconstructed)",
+                "llm_model": "gemini-2.5-flash",
+                "llm_provider": "Google (Emergent Key)",
+                "support_tools": "",
+                "pages_sent": 0,
+                "started_at": "", "completed_at": f.get("created_at", ""),
+                "duration_sec": 0,
+                "missing_fields": missing,
+                "issue_reason": issue,
+                "retries": 0,
+            })
 
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -3140,6 +3357,18 @@ async def startup():
         await db.runs.update_many({"status": "processing"}, {"$set": {"status": "stale"}})
         await db.progress.update_many({"status": "processing"}, {"$set": {"status": "stale", "message": "Processing interrupted — click Retry to resume"}})
         logger.warning(f"Marked {stale} stale processing runs for retry")
+    # One-time self-heal: recompute stats for every completed run so historical
+    # stats drift (from old retention / bad formulas) is corrected.
+    completed = await db.runs.find({"status": "completed"}, {"_id": 0, "id": 1, "user_id": 1}).to_list(5000)
+    healed = 0
+    for r in completed:
+        try:
+            await recompute_run_stats(r["id"], r["user_id"])
+            healed += 1
+        except Exception as e:
+            logger.warning(f"Stats recompute failed for {r.get('id','?')}: {e}")
+    if healed:
+        logger.info(f"Startup stats self-heal: recomputed {healed} completed run(s)")
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trueflow.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "TrueFlow2024!")

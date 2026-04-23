@@ -62,6 +62,10 @@ Build a construction-industry contact extraction portal. Users upload PDFs/ZIPs 
 - **Accounting summary bars**: "This Run" and "All Contacts" tabs now show a summary row (Files uploaded / Contacts / Duplicates / Issues / No contacts found) and cross-run totals via new `/api/stats/all` endpoint.
 - **Master Index tab**: upload CSV/XLSX with a `FileName` column; compares against Skip Registry + run history and reports status per file (`Processed`, `Processed (no contacts)`, `Error`, `Pending`, `Not Uploaded`). Summary cards + file-type breakdown + searchable table + downloadable comparison CSV. Endpoints: `POST /api/master-index/upload`, `GET /api/master-index`, `GET /api/master-index/download`, `DELETE /api/master-index`.
 - **Extended file format support**: `.txt` (direct decode → Gemini Text), `.odt` (odfpy → Gemini Text, LibreOffice vision fallback), `.rtf` (striprtf → Gemini Text, LibreOffice vision fallback), `.eml` (stdlib email → Gemini Text). All integrated with dedup, logging, Skip Registry, and Master Index.
+- **Run stats self-healing**: `/api/runs` and `/api/runs/{id}` now recompute `total_pdfs`/`processed`/`errors`/`duplicates_removed`/`net_new` from live collection counts on every read. Fixes pre-existing drift (e.g. `processed = -21` bug). One-time backfill runs on startup. Completion snapshot now uses authoritative `files.count_documents` (not local `total_files` variable).
+- **Excel log fallback**: when `file_logs` is empty (old runs or pruned data), `/api/runs/{id}/log` and `/api/runs/{id}/download/log` synthesize rows from `files`+`contacts`+`processing_errors` so the log download never returns empty.
+- **Log retention removed**: file_logs kept forever (was: keep-3-runs). Disk indicator replaces the old retention policy.
+- **Container disk utilization indicator**: new admin endpoints `GET /api/admin/disk-usage` and `POST /api/admin/disk-usage/clear-staging`. Admin page shows %-used bars for `/app`, `/`, `/tmp` with color-coded thresholds (green < 50%, sky < 75%, amber < 90%, red ≥ 90%) plus a "Clear Staging" button.
 
 ## Prioritized Backlog
 - **P1**: Password reset flow.

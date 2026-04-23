@@ -17,6 +17,8 @@ export default function AdminPage() {
     claude_api_key_set: false, openai_api_key_set: false,
   });
   const [storage, setStorage] = useState(null);
+  const [diskUsage, setDiskUsage] = useState(null);
+  const [clearingStaging, setClearingStaging] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [cleaning, setCleaning] = useState(false);
@@ -32,14 +34,32 @@ export default function AdminPage() {
     } catch {}
   }, []);
 
+  const fetchDiskUsage = useCallback(async () => {
+    try {
+      const { data } = await api.get('/admin/disk-usage');
+      setDiskUsage(data);
+    } catch {}
+  }, []);
+
+  const handleClearStaging = async () => {
+    setClearingStaging(true);
+    try {
+      const { data } = await api.post('/admin/disk-usage/clear-staging');
+      toast.success(`Staging cleared — freed ${data.freed_mb} MB`);
+      await fetchDiskUsage();
+    } catch { toast.error('Failed to clear staging'); }
+    setClearingStaging(false);
+  };
+
   useEffect(() => {
     if (user && user.role !== 'admin') { navigate('/'); return; }
     (async () => {
       try { const { data } = await api.get('/admin/settings'); setConfig(data); } catch {}
       await fetchStorage();
+      await fetchDiskUsage();
       setLoading(false);
     })();
-  }, [user, navigate, fetchStorage]);
+  }, [user, navigate, fetchStorage, fetchDiskUsage]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -217,6 +237,52 @@ export default function AdminPage() {
               <p className="text-[10px] text-slate-600 mt-1">Exponential backoff: 2s → 10s → 30s → 60s → 120s</p>
             </div>
           </div>
+        </section>
+
+        {/* Container Disk Utilization */}
+        <section className="bg-[#111827] border border-slate-800 rounded-sm p-6 space-y-4" data-testid="disk-usage-section">
+          <div className="flex items-center gap-2 mb-2">
+            <HardDrive className="h-4 w-4 text-cyan-400" strokeWidth={1.5} />
+            <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider">Container Disk Utilization</h2>
+          </div>
+          <p className="text-xs text-slate-500">
+            Disk usage inside the running pod. When <span className="text-slate-300 font-mono">/app</span> or <span className="text-slate-300 font-mono">/tmp</span> approach 100%, uploads and LibreOffice conversions may fail. Clear the chunked-upload staging dir first, then consider deleting old runs.
+          </p>
+          {diskUsage?.mounts?.map(m => {
+            if (m.error) return (
+              <div key={m.path} className="text-xs text-red-400">{m.label}: {m.error}</div>
+            );
+            const pct = m.percent_used || 0;
+            const color = pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : pct >= 50 ? 'bg-sky-500' : 'bg-emerald-500';
+            const text = pct >= 90 ? 'text-red-400' : pct >= 75 ? 'text-amber-400' : 'text-slate-300';
+            return (
+              <div key={m.path} className="space-y-1.5" data-testid={`disk-mount-${m.path.replace(/\//g,'_')}`}>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400 font-mono">{m.label}</span>
+                  <span className={text}>
+                    <span className="font-semibold" data-testid={`disk-pct-${m.path.replace(/\//g,'_')}`}>{pct}%</span>
+                    <span className="text-slate-600"> · {m.used_gb} / {m.total_gb} GB · {m.free_gb} GB free</span>
+                  </span>
+                </div>
+                <div className="bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div className={`${color} h-full transition-all duration-500`} style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            );
+          })}
+          {diskUsage && (
+            <div className="flex items-center justify-between pt-3 border-t border-slate-800 text-xs">
+              <div className="text-slate-500">
+                Chunked upload staging: <span className="text-slate-300 font-mono">{diskUsage.chunked_upload_staging_mb} MB</span>
+                <span className="text-slate-600 ml-1">({diskUsage.chunked_upload_staging_path})</span>
+              </div>
+              <button onClick={handleClearStaging} disabled={clearingStaging || diskUsage.chunked_upload_staging_mb === 0}
+                className="bg-transparent border border-cyan-500/30 text-cyan-300 hover:bg-cyan-500 hover:text-white rounded-sm px-3 py-1.5 font-medium transition-colors inline-flex items-center gap-2 disabled:opacity-40"
+                data-testid="clear-staging-button">
+                {clearingStaging ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Clear Staging
+              </button>
+            </div>
+          )}
         </section>
 
         {/* Storage Management */}
