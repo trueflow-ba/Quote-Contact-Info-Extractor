@@ -523,6 +523,7 @@ os.makedirs(CHUNK_UPLOAD_DIR, exist_ok=True)
 
 # Accepted extensions for inputs (PDF-style docs + images; ZIP is handled separately)
 SUPPORTED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.xlsx', '.xls', '.txt',
+                        '.odt', '.rtf', '.eml',
                         '.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp')
 
 
@@ -592,7 +593,8 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
                 ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                           'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
-                          'txt': 'text/plain',
+                          'txt': 'text/plain', 'odt': 'application/vnd.oasis.opendocument.text',
+                          'rtf': 'application/rtf', 'eml': 'message/rfc822',
                           'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp',
                           'heic': 'image/heic', 'heif': 'image/heif', 'tiff': 'image/tiff', 'tif': 'image/tiff', 'bmp': 'image/bmp'}
                 content_type = ct_map.get(ext, 'application/octet-stream')
@@ -876,6 +878,92 @@ def extract_text_from_xlsx(file_bytes: bytes, filename: str):
     except Exception as e:
         logger.error(f"XLSX extraction failed for {filename}: {e}")
         return None, {"reason": f"Failed to read XLSX: {str(e)}", "missing_fields": "All fields"}
+
+
+def extract_text_from_odt(file_bytes: bytes, filename: str):
+    """Extract plain text from an OpenDocument Text (.odt) file."""
+    try:
+        from odf.opendocument import load as odf_load
+        from odf import text as odf_text, teletype
+        doc = odf_load(io.BytesIO(file_bytes))
+        parts = []
+        for para in doc.getElementsByType(odf_text.P):
+            s = teletype.extractText(para).strip()
+            if s:
+                parts.append(s)
+        for head in doc.getElementsByType(odf_text.H):
+            s = teletype.extractText(head).strip()
+            if s:
+                parts.append(s)
+        text = "\n".join(parts).strip()
+        if text:
+            return text, None
+        return None, {"reason": "No text found in ODT", "missing_fields": "All fields"}
+    except Exception as e:
+        logger.error(f"ODT extraction failed for {filename}: {e}")
+        return None, {"reason": f"Failed to read ODT: {str(e)}", "missing_fields": "All fields"}
+
+
+def extract_text_from_rtf(file_bytes: bytes, filename: str):
+    """Extract plain text from an RTF file via striprtf."""
+    try:
+        from striprtf.striprtf import rtf_to_text
+        raw = file_bytes.decode("utf-8", errors="replace")
+        text = rtf_to_text(raw, errors="ignore").strip()
+        if text:
+            return text, None
+        return None, {"reason": "No text found in RTF", "missing_fields": "All fields"}
+    except Exception as e:
+        logger.error(f"RTF extraction failed for {filename}: {e}")
+        return None, {"reason": f"Failed to read RTF: {str(e)}", "missing_fields": "All fields"}
+
+
+def extract_text_from_eml(file_bytes: bytes, filename: str):
+    """Extract readable text from an email (.eml) file, including headers that
+    are useful for contact extraction (From/To/Subject) and the body.
+    HTML bodies are unwrapped to text."""
+    try:
+        from email import message_from_bytes, policy
+        msg = message_from_bytes(file_bytes, policy=policy.default)
+        parts = []
+        subj = msg.get("Subject", "")
+        frm = msg.get("From", "")
+        to = msg.get("To", "")
+        cc = msg.get("Cc", "")
+        dt = msg.get("Date", "")
+        if subj: parts.append(f"Subject: {subj}")
+        if frm:  parts.append(f"From: {frm}")
+        if to:   parts.append(f"To: {to}")
+        if cc:   parts.append(f"Cc: {cc}")
+        if dt:   parts.append(f"Date: {dt}")
+        parts.append("---")
+        body_text = None
+        # Prefer text/plain; fall back to stripping tags from text/html
+        try:
+            body_part = msg.get_body(preferencelist=("plain", "html"))
+        except Exception:
+            body_part = None
+        if body_part is not None:
+            content = body_part.get_content()
+            if body_part.get_content_type() == "text/html":
+                # Very light HTML-to-text: drop tags, collapse whitespace
+                text = re.sub(r"<br\s*/?>", "\n", content, flags=re.I)
+                text = re.sub(r"</p\s*>", "\n\n", text, flags=re.I)
+                text = re.sub(r"<[^>]+>", "", text)
+                text = re.sub(r"[ \t]+", " ", text)
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                body_text = text.strip()
+            else:
+                body_text = content.strip()
+        if body_text:
+            parts.append(body_text)
+        text = "\n".join(parts).strip()
+        if text:
+            return text, None
+        return None, {"reason": "No readable body found in EML", "missing_fields": "All fields"}
+    except Exception as e:
+        logger.error(f"EML extraction failed for {filename}: {e}")
+        return None, {"reason": f"Failed to read EML: {str(e)}", "missing_fields": "All fields"}
 
 def convert_doc_to_images(file_bytes: bytes, filename: str, suffix: str):
     """Convert DOCX/XLSX to images via LibreOffice for Gemini vision fallback.
@@ -1430,6 +1518,7 @@ async def extract_contacts_with_gemini_text(text: str, filename: str, api_key: s
 # =============================================================================
 FILE_TYPE_MAP = {
     'pdf': 'PDF', 'docx': 'DOCX', 'doc': 'DOC', 'xlsx': 'XLSX', 'xls': 'XLS', 'txt': 'TXT',
+    'odt': 'ODT', 'rtf': 'RTF', 'eml': 'EML',
     'jpg': 'Image/JPG', 'jpeg': 'Image/JPG', 'png': 'Image/PNG', 'webp': 'Image/WEBP',
     'heic': 'Image/HEIC', 'heif': 'Image/HEIF', 'tiff': 'Image/TIFF', 'tif': 'Image/TIFF', 'bmp': 'Image/BMP',
 }
@@ -1636,6 +1725,64 @@ async def process_run(run_id: str, user_id: str):
                         approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
                     elif not gemini_error:
                         gemini_error = "TXT file was empty"
+                elif ext == 'eml':
+                    # Email → parse headers+body → Gemini text (no vision fallback needed)
+                    contacts, gemini_error = [], None
+                    text, err = extract_text_from_eml(file_bytes, filename)
+                    if text:
+                        support_tools.append("email (stdlib)")
+                        processing_tool = "Gemini Text (EML)"
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
+                    else:
+                        gemini_error = (err or {}).get("reason") if isinstance(err, dict) else "EML parsing failed"
+                elif ext == 'rtf':
+                    # RTF → striprtf text → Gemini text, LibreOffice vision fallback
+                    contacts, gemini_error = [], None
+                    text, _ = extract_text_from_rtf(file_bytes, filename)
+                    if text:
+                        support_tools.append("striprtf")
+                        processing_tool = "Gemini Text (RTF)"
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
+                    if not contacts:
+                        logger.info(f"RTF fallback to vision for {filename}")
+                        images, conv_err = convert_doc_to_images(file_bytes, filename, ".rtf")
+                        if images:
+                            support_tools.append("LibreOffice")
+                            support_tools.append("poppler-utils")
+                            pages_sent = min(len(images), 8)
+                            processing_tool = "Gemini Vision (LibreOffice Fallback)"
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images(images, filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
+                        elif gemini_error is None:
+                            gemini_error = conv_err or "LibreOffice conversion failed"
+                elif ext == 'odt':
+                    # ODT → odfpy text → Gemini text, LibreOffice vision fallback
+                    contacts, gemini_error = [], None
+                    text, _ = extract_text_from_odt(file_bytes, filename)
+                    if text:
+                        support_tools.append("odfpy")
+                        processing_tool = "Gemini Text (ODT)"
+                        contacts, gemini_error, r = await extract_contacts_with_gemini_text(text, filename, gemini_key, max_attempts)
+                        retries_used += r
+                        approx_cost += COST_PER_TEXT_CALL_USD + COST_OVERHEAD_USD
+                    if not contacts:
+                        logger.info(f"ODT fallback to vision for {filename}")
+                        images, conv_err = convert_doc_to_images(file_bytes, filename, ".odt")
+                        if images:
+                            support_tools.append("LibreOffice")
+                            support_tools.append("poppler-utils")
+                            pages_sent = min(len(images), 8)
+                            processing_tool = "Gemini Vision (LibreOffice Fallback)"
+                            contacts, gemini_error, r = await extract_contacts_with_gemini_from_images(images, filename, gemini_key, max_attempts)
+                            retries_used += r
+                            approx_cost += pages_sent * COST_PER_VISION_PAGE_USD + COST_OVERHEAD_USD
+                        elif gemini_error is None:
+                            gemini_error = conv_err or "LibreOffice conversion failed"
                 elif ext in ('docx', 'doc'):
                     # Step 1: text extraction via python-docx (only for .docx)
                     text = None
