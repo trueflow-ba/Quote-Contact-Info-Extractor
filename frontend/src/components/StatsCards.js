@@ -1,7 +1,7 @@
 import { FileText, AlertTriangle, CheckCircle, Users, MinusCircle, Copy, Ban, TrendingUp, GitMerge } from 'lucide-react';
 
 const statConfig = [
-  { key: 'total_pdfs', label: 'Total PDFs', icon: FileText, color: 'text-sky-400' },
+  { key: 'total_pdfs', label: 'Total Files', icon: FileText, color: 'text-sky-400' },
   { key: 'processed', label: 'Processed', icon: CheckCircle, color: 'text-emerald-400' },
   { key: 'errors', label: 'Errors', icon: AlertTriangle, color: 'text-red-400' },
   { key: 'net_new', label: 'Net New Contacts', icon: TrendingUp, color: 'text-amber-400' },
@@ -9,8 +9,8 @@ const statConfig = [
 
 const detailStats = [
   { key: 'contacts_extracted', label: 'Total Extracted', icon: Users },
-  { key: 'duplicates_removed', label: 'Duplicates (all)', icon: Copy },
-  { key: 'cross_run_duplicates', label: 'Already in Prior Runs', icon: GitMerge },
+  { key: 'duplicates_removed', label: 'Duplicates', icon: Copy },
+  { key: 'cross_run_duplicates', label: 'Cross-Run Dupes', icon: GitMerge },
   { key: 'excluded_no_contact', label: 'No Contact Info', icon: MinusCircle },
   { key: 'excluded_internal', label: 'Internal Excluded', icon: Ban },
 ];

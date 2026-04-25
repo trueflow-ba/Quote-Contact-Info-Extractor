@@ -22,27 +22,40 @@ export default function DashboardPage() {
   const [errors, setErrors] = useState([]);
   const [duplicates, setDuplicates] = useState([]);
   const [chartData, setChartData] = useState(null);
+  const [allStats, setAllStats] = useState(null);
   const [files, setFiles] = useState([]);
   const [progress, setProgress] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const pollRef = useRef(null);
 
+  // Aggregate stats + cross-run charts (used by the top StatsCards and DataViz)
+  const refreshAllStatsAndCharts = useCallback(async () => {
+    try {
+      const [s, ch] = await Promise.all([
+        api.get('/stats/all'),
+        api.get('/contacts/all/charts'),
+      ]);
+      setAllStats(s.data);
+      setChartData(ch.data);
+    } catch {}
+  }, []);
+
   // -- Refresh helpers (no deps on other callbacks) --
   const refreshRunData = useCallback(async (runId) => {
     try {
-      const [r, c, e, d, ch] = await Promise.all([
+      const [r, c, e, d] = await Promise.all([
         api.get(`/runs/${runId}`), api.get(`/runs/${runId}/contacts`),
         api.get(`/runs/${runId}/errors`), api.get(`/runs/${runId}/duplicates`),
-        api.get(`/runs/${runId}/charts`),
       ]);
       setCurrentRun(r.data);
       setContacts(c.data);
       setErrors(e.data);
       setDuplicates(d.data);
-      setChartData(ch.data);
     } catch {}
-  }, []);
+    // Always refresh aggregate stats + charts after per-run data changes
+    refreshAllStatsAndCharts();
+  }, [refreshAllStatsAndCharts]);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -85,13 +98,13 @@ export default function DashboardPage() {
           else if (data.status === 'failed') toast.error('Processing failed: ' + (data.message || ''));
           // Full refresh on completion
           try {
-            const [r, c, e, d, ch] = await Promise.all([
+            const [r, c, e, d, s, ch] = await Promise.all([
               api.get(`/runs/${runId}`), api.get(`/runs/${runId}/contacts`),
               api.get(`/runs/${runId}/errors`), api.get(`/runs/${runId}/duplicates`),
-              api.get(`/runs/${runId}/charts`),
+              api.get('/stats/all'), api.get('/contacts/all/charts'),
             ]);
             setCurrentRun(r.data); setContacts(c.data); setErrors(e.data);
-            setDuplicates(d.data); setChartData(ch.data);
+            setDuplicates(d.data); setAllStats(s.data); setChartData(ch.data);
           } catch {}
           try { const { data: allRuns } = await api.get('/runs'); setRuns(allRuns); } catch {}
           if (data.status === 'completed' || data.status === 'cancelled') setProgress(null);
@@ -108,6 +121,8 @@ export default function DashboardPage() {
         setCurrentRunId(data[0].id);
         setCurrentRun(data[0]);
       }
+      // Load aggregate stats + cross-run charts on first paint
+      refreshAllStatsAndCharts();
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -149,7 +164,7 @@ export default function DashboardPage() {
     setRuns(updated);
     if (currentRunId === runId) {
       if (updated.length > 0) { setCurrentRunId(updated[0].id); setCurrentRun(updated[0]); }
-      else { setCurrentRunId(null); setCurrentRun(null); setContacts([]); setErrors([]); setDuplicates([]); setChartData(null); }
+      else { setCurrentRunId(null); setCurrentRun(null); setContacts([]); setErrors([]); setDuplicates([]); setChartData(null); setAllStats(null); }
     }
   };
 
@@ -276,7 +291,7 @@ export default function DashboardPage() {
     <div className="min-h-screen bg-[#0A0F1C]" data-testid="dashboard-page">
       <Header />
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        <StatsCards stats={currentRun?.stats} />
+        <StatsCards stats={allStats?.stats || currentRun?.stats} />
 
         <div className="space-y-4">
           <UploadZone files={files} setFiles={setFiles} />

@@ -2511,13 +2511,42 @@ async def get_all_stats(request: Request):
     total_duplicates = await db.duplicates.count_documents({"user_id": user_id})
     total_errors = await db.processing_errors.count_documents({"user_id": user_id})
     total_runs = await db.runs.count_documents({"user_id": user_id})
+    total_files_uploaded = await db.files.count_documents({"user_id": user_id})
+
+    # Sum the per-run summary fields across all runs
+    sums = {"contacts_extracted": 0, "excluded_no_contact": 0, "excluded_internal": 0, "cross_run_duplicates": 0, "approx_cost_usd": 0.0}
+    async for r in db.runs.find({"user_id": user_id}, {"_id": 0, "stats": 1}):
+        s = r.get("stats") or {}
+        for k in ("contacts_extracted", "excluded_no_contact", "excluded_internal", "cross_run_duplicates"):
+            sums[k] += int(s.get(k, 0) or 0)
+        try:
+            sums["approx_cost_usd"] += float(s.get("approx_cost_usd", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    sums["approx_cost_usd"] = round(sums["approx_cost_usd"], 4)
 
     return {
+        # Cross-run "all" totals (used by All Contacts accounting bar)
         "total_unique_files": total_unique_files,
         "total_contacts": total_contacts,
         "total_duplicates": total_duplicates,
         "total_errors": total_errors,
         "total_runs": total_runs,
+        # Flat shape for StatsCards (mirrors per-run stats keys exactly).
+        # Uses unique files (SHA-256 dedup'd) as the canonical count to avoid
+        # inflating the number when the same file was uploaded in multiple runs.
+        "stats": {
+            "total_pdfs": total_unique_files,
+            "processed": max(0, total_unique_files - total_errors),
+            "errors": total_errors,
+            "net_new": total_contacts,
+            "contacts_extracted": sums["contacts_extracted"] or (total_contacts + total_duplicates + sums["excluded_no_contact"] + sums["excluded_internal"]),
+            "duplicates_removed": total_duplicates,
+            "cross_run_duplicates": sums["cross_run_duplicates"],
+            "excluded_no_contact": sums["excluded_no_contact"],
+            "excluded_internal": sums["excluded_internal"],
+            "approx_cost_usd": sums["approx_cost_usd"],
+        },
     }
 
 @api_router.get("/contacts/all/charts")
