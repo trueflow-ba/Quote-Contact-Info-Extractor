@@ -119,3 +119,12 @@ credentials.json
 # Test reports may contain credentials
 test_reports/
 /app/test_reports/
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
