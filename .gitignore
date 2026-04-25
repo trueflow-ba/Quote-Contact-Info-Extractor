@@ -115,3 +115,7 @@ credentials.json
 *.pem
 *.key
 .credentials
+
+# Test reports may contain credentials
+test_reports/
+/app/test_reports/
