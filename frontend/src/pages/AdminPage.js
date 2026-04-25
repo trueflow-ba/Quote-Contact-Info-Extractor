@@ -13,7 +13,7 @@ export default function AdminPage() {
   const navigate = useNavigate();
   const [config, setConfig] = useState({
     ai_model: 'claude-sonnet', claude_api_key: '', openai_api_key: '',
-    max_pdfs_per_upload: 50, storage_max_mb: 750, storage_target_mb: 300,
+    max_pdfs_per_upload: 7000, storage_max_mb: 750, storage_target_mb: 300,
     claude_api_key_set: false, openai_api_key_set: false,
   });
   const [storage, setStorage] = useState(null);
@@ -196,11 +196,11 @@ export default function AdminPage() {
             <Hash className="h-4 w-4 text-emerald-400" strokeWidth={1.5} />
             <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider">Upload Limits</h2>
           </div>
-          <p className="text-xs text-slate-500">Maximum number of PDFs a user can upload per run (directly or via ZIP).</p>
+          <p className="text-xs text-slate-500">Maximum number of files (PDF/DOCX/XLSX/etc., directly or via ZIP) a user can upload in a single batch. If a batch exceeds this cap the entire upload is rejected with a clear error — no files are silently dropped. Range: 1–10,000.</p>
           <div>
-            <label className="block text-xs text-slate-400 mb-1.5">Max PDFs per upload</label>
-            <Input data-testid="max-pdfs-input" type="number" min={1} max={500} value={config.max_pdfs_per_upload}
-              onChange={e => setConfig(s => ({ ...s, max_pdfs_per_upload: parseInt(e.target.value) || 50 }))} className="bg-[#0A0F1C] border-slate-800 text-slate-300 w-32 font-mono" />
+            <label className="block text-xs text-slate-400 mb-1.5">Max files per upload</label>
+            <Input data-testid="max-pdfs-input" type="number" min={1} max={10000} value={config.max_pdfs_per_upload}
+              onChange={e => setConfig(s => ({ ...s, max_pdfs_per_upload: parseInt(e.target.value) || 7000 }))} className="bg-[#0A0F1C] border-slate-800 text-slate-300 w-32 font-mono" />
           </div>
         </section>
 

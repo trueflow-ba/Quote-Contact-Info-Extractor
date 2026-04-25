@@ -342,7 +342,7 @@ async def get_admin_settings(request: Request):
     await require_admin(request)
     config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
     if not config:
-        config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 50, "storage_max_mb": 750, "storage_target_mb": 300}
+        config = {"key": "global", "ai_model": "claude-sonnet", "claude_api_key": "", "openai_api_key": "", "max_pdfs_per_upload": 7000, "storage_max_mb": 750, "storage_target_mb": 300}
     # Default values for safety controls
     config.setdefault("budget_ceiling_usd", 100.0)
     config.setdefault("consecutive_failure_threshold", 10)
@@ -370,7 +370,7 @@ async def update_admin_settings(input: AdminSettingsInput, request: Request):
     if input.openai_api_key is not None:
         update["openai_api_key"] = input.openai_api_key
     if input.max_pdfs_per_upload is not None:
-        update["max_pdfs_per_upload"] = max(1, min(500, input.max_pdfs_per_upload))
+        update["max_pdfs_per_upload"] = max(1, min(10000, input.max_pdfs_per_upload))
     if input.storage_max_mb is not None:
         update["storage_max_mb"] = max(100, min(10000, input.storage_max_mb))
     if input.storage_target_mb is not None:
@@ -595,15 +595,22 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
     """Shared core: given list of (filename, bytes), unzip if needed, create a run,
     queue background object-storage upload, return result dict.
     Used by BOTH the legacy `/upload` and chunked `/upload/chunk/{id}/complete`.
+
+    Behavior change (2026-04-25): if the upload contains MORE files than
+    max_pdfs, the WHOLE upload is rejected with a clear 400 error. Previously
+    we silently truncated past the cap, which caused users to lose files
+    without realising it.
     """
     import hashlib as _hashlib
     run_id = str(uuid.uuid4())
     pdf_buffers = []  # list of (filename, bytes, sha256_hex)
-    rejected_files = []
 
     def _sha256_hex(data: bytes) -> str:
         return _hashlib.sha256(data).hexdigest()
 
+    # First pass: count how many supported files this upload contains so we can
+    # fail fast (no partial uploads) when it exceeds the cap.
+    eligible_count = 0
     for filename, data in filename_bytes_pairs:
         fname_lower = filename.lower()
         if fname_lower.endswith(".zip"):
@@ -612,20 +619,35 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                     for name in zf.namelist():
                         nlower = name.lower()
                         if any(nlower.endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not name.startswith("__MACOSX"):
-                            if len(pdf_buffers) >= max_pdfs:
-                                rejected_files.append(name.split("/")[-1])
-                                continue
-                            inner_bytes = zf.read(name)
-                            pdf_buffers.append((name.split("/")[-1], inner_bytes, _sha256_hex(inner_bytes)))
+                            eligible_count += 1
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
         elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-            if len(pdf_buffers) >= max_pdfs:
-                rejected_files.append(filename)
-                continue
+            eligible_count += 1
+        # Unsupported types are reported during the second pass below.
+
+    if eligible_count > max_pdfs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload contains {eligible_count} files but the per-upload cap is {max_pdfs}. "
+                   f"Split the batch (or raise the cap in Admin → Upload Limits) and try again. "
+                   f"No files were processed."
+        )
+
+    # Second pass: actually unpack the bytes.
+    for filename, data in filename_bytes_pairs:
+        fname_lower = filename.lower()
+        if fname_lower.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for name in zf.namelist():
+                    nlower = name.lower()
+                    if any(nlower.endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not name.startswith("__MACOSX"):
+                        inner_bytes = zf.read(name)
+                        pdf_buffers.append((name.split("/")[-1], inner_bytes, _sha256_hex(inner_bytes)))
+        elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             pdf_buffers.append((filename, data, _sha256_hex(data)))
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}. Accepted: PDF, DOCX, XLSX, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}. Accepted: PDF, DOCX, XLSX, TXT, ODT, RTF, EML, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
 
     if not pdf_buffers:
         raise HTTPException(status_code=400, detail="No supported files found in upload")
@@ -3427,7 +3449,7 @@ async def startup():
             "ai_model": "claude-sonnet",
             "claude_api_key": "",
             "openai_api_key": "",
-            "max_pdfs_per_upload": 50,
+            "max_pdfs_per_upload": 7000,
             "storage_max_mb": 750,
             "storage_target_mb": 300,
             "created_at": datetime.now(timezone.utc).isoformat()

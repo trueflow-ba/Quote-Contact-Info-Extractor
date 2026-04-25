@@ -226,9 +226,10 @@ export default function DashboardPage() {
       setCurrentRunId(runId);
       setFiles([]);
       if (uploadData.rejected_count) {
-        toast.warning(`${uploadData.total_files} PDF(s) accepted. ${uploadData.rejected_count} rejected (limit: ${uploadData.max_pdfs}).`);
+        // Legacy response shape — kept for safety but the backend no longer truncates.
+        toast.warning(`${uploadData.total_files} file(s) accepted. ${uploadData.rejected_count} rejected (limit: ${uploadData.max_pdfs}).`);
       } else {
-        toast.success(`${uploadData.total_files} PDF(s) — uploading to storage...`);
+        toast.success(`${uploadData.total_files} file(s) — uploading to storage...`);
       }
       setIsUploading(false);
       setIsProcessing(true);
