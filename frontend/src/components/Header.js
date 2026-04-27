@@ -1,12 +1,20 @@
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useEffect, useState } from 'react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { LayoutDashboard, Settings, LogOut, User, ChevronDown, Shield } from 'lucide-react';
+import { APP_VERSION, APP_BUILD_DATE } from '@/version';
+import api from '@/lib/api';
 
 export default function Header() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [backendVersion, setBackendVersion] = useState(null);
+
+  useEffect(() => {
+    api.get('/version').then(r => setBackendVersion(r.data)).catch(() => {});
+  }, []);
 
   const handleLogout = async () => {
     await logout();
@@ -30,6 +38,16 @@ export default function Header() {
             </div>
             <span className="text-slate-200 font-semibold text-sm hidden sm:block tracking-tight group-hover:text-white transition-colors">
               TrueFlow
+            </span>
+            <span
+              className="hidden sm:inline-flex items-center gap-1 text-[10px] font-mono text-slate-500 bg-slate-800/60 border border-slate-800 rounded-sm px-1.5 py-0.5 ml-1 hover:text-slate-300 transition-colors"
+              title={`Frontend v${APP_VERSION} (${APP_BUILD_DATE})${backendVersion ? `\nBackend v${backendVersion.version} (${backendVersion.build_date})` : '\nBackend: contacting...'}`}
+              data-testid="app-version-badge"
+            >
+              v{APP_VERSION}
+              {backendVersion && backendVersion.version !== APP_VERSION && (
+                <span className="text-amber-400" title="Backend version differs from frontend">⚠</span>
+              )}
             </span>
           </button>
 

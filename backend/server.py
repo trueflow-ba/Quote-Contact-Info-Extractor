@@ -260,6 +260,18 @@ async def logout(response: Response):
     response.delete_cookie("refresh_token", path="/")
     return {"message": "Logged out"}
 
+APP_VERSION = "0.3.0"
+APP_BUILD_DATE = "2026-04-27"
+
+
+@api_router.get("/version")
+async def get_version():
+    """Returns the deployed backend version. Used by the header to confirm
+    that the frontend and backend builds are in sync, and to verify the
+    most recent deploy actually took effect."""
+    return {"version": APP_VERSION, "build_date": APP_BUILD_DATE}
+
+
 @api_router.get("/auth/me")
 async def get_me(request: Request):
     return await get_current_user(request)
