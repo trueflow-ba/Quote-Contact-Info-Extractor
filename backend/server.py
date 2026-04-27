@@ -788,6 +788,9 @@ async def chunk_upload(upload_id: str, request: Request,
     if index < 0 or index >= session["total_chunks"]:
         raise HTTPException(status_code=400, detail="Chunk index out of range")
     chunk_dir = os.path.join(CHUNK_UPLOAD_DIR, upload_id)
+    # Defensive: ensure dir exists. /tmp is wiped on pod restart, so the
+    # init-time mkdir may be gone by the time chunks start arriving.
+    os.makedirs(chunk_dir, exist_ok=True)
     chunk_path = os.path.join(chunk_dir, f"chunk_{index:06d}.bin")
     data = await chunk.read()
     with open(chunk_path, "wb") as f:
@@ -818,8 +821,17 @@ async def chunk_complete(upload_id: str, request: Request):
     parts = []
     for i in range(session["total_chunks"]):
         p = os.path.join(chunk_dir, f"chunk_{i:06d}.bin")
-        with open(p, "rb") as f:
-            parts.append(f.read())
+        try:
+            with open(p, "rb") as f:
+                parts.append(f.read())
+        except FileNotFoundError:
+            # Chunk staging was wiped (e.g., pod restart between chunks). Tell
+            # the client to re-init and re-upload — the data on /tmp is gone.
+            await db.chunk_uploads.delete_one({"upload_id": upload_id})
+            raise HTTPException(
+                status_code=410,
+                detail="Upload staging was lost (pod restart). Please re-upload — your previous chunks are no longer on disk."
+            )
     full_bytes = b"".join(parts)
     if len(full_bytes) != session["total_size"]:
         logger.warning(f"Chunked upload {upload_id} size mismatch: got {len(full_bytes)}, expected {session['total_size']}")
@@ -3348,20 +3360,18 @@ async def delete_all_data(request: Request):
 # =============================================================================
 @app.on_event("startup")
 async def startup():
-    # Ensure poppler is installed (needed for pdf2image)
+    # Verify required binaries exist (poppler for pdf2image, optional libreoffice
+    # for legacy .doc/.xls). In Emergent production these are baked into the image;
+    # in dev they're installed via the deploy script. We just log a warning if missing.
     import subprocess
     try:
         subprocess.run(["which", "pdftoppm"], check=True, capture_output=True)
     except subprocess.CalledProcessError:
-        logger.warning("poppler-utils not found, installing...")
-        subprocess.run(["apt-get", "install", "-y", "poppler-utils"], capture_output=True)
-    # Ensure LibreOffice is installed (needed for DOCX/XLSX vision fallback)
+        logger.warning("poppler-utils not found — PDF processing will fail")
     try:
         subprocess.run(["which", "libreoffice"], check=True, capture_output=True)
     except subprocess.CalledProcessError:
-        logger.warning("libreoffice not found, installing in background...")
-        subprocess.Popen(["apt-get", "install", "-y", "--no-install-recommends", "libreoffice"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info("libreoffice not present — .doc/.xls/.odt/.rtf vision fallback unavailable. DOCX/XLSX will still work via direct text extraction.")
     try:
         init_storage()
         logger.info("Object storage initialized")
