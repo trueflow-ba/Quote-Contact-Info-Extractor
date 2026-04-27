@@ -116,3 +116,12 @@ memory/mongo_backup/
 /app/memory/mongo_backup/
 frontend/node_modules/.cache/default-development/24.pack
 frontend/node_modules/.cache/default-development/26.pack
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
