@@ -887,27 +887,6 @@ def ocr_with_tesseract(images, filename):
     avg_conf = total_conf / conf_count if conf_count > 0 else 0
     return text, avg_conf
 
-def ocr_with_easyocr(images, filename):
-    """Backup OCR: EasyOCR (deep learning). Returns (text, avg_confidence)."""
-    import easyocr
-    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-    import numpy as np
-    all_text = []
-    total_conf = 0
-    conf_count = 0
-    for img in images:
-        img_array = np.array(img)
-        results = reader.readtext(img_array)
-        page_parts = []
-        for (_, text, conf) in results:
-            page_parts.append(text)
-            total_conf += conf
-            conf_count += 1
-        all_text.append(" ".join(page_parts))
-    text = "\n".join(all_text).strip()
-    avg_conf = (total_conf / conf_count * 100) if conf_count > 0 else 0
-    return text, avg_conf
-
 # =============================================================================
 # DOCX / XLSX TEXT EXTRACTION
 # =============================================================================
@@ -1157,29 +1136,17 @@ async def extract_text_from_pdf(pdf_bytes: bytes, filename: str):
             if tess2_text and tess2_conf >= 70:
                 return tess2_text, None
 
-            # Step 3: EasyOCR (deep learning backup)
-            easy_text, easy_conf = "", 0
-            try:
-                easy_text, easy_conf = ocr_with_easyocr(images, filename)
-                logger.info(f"EasyOCR for {filename}: conf={easy_conf:.0f}%, chars={len(easy_text)}")
-            except Exception as e:
-                logger.warning(f"EasyOCR failed for {filename}: {e}")
-
-            if easy_text and easy_conf >= 70:
-                return easy_text, None
-
-            # Step 4: Pick the best result from all attempts
+            # Step 3: Pick the best result from Tesseract attempts
             candidates = [
                 (tess_text, tess_conf, "Tesseract"),
                 (tess2_text, tess2_conf, "Tesseract-preprocessed"),
-                (easy_text, easy_conf, "EasyOCR"),
             ]
             best_text, best_conf, best_engine = max(candidates, key=lambda c: (len(c[0]), c[1]))
 
             if not best_text:
-                return None, {"reason": "No text layer detected - all OCR engines failed", "missing_fields": "All fields"}
+                return None, {"reason": "No text layer detected - OCR failed", "missing_fields": "All fields"}
 
-            # We have text but below 70% confidence from any engine
+            # We have text but below 70% confidence
             return best_text, {
                 "reason": f"Low confidence OCR ({best_conf:.0f}% via {best_engine}) - manual review recommended",
                 "partial": True
