@@ -3477,7 +3477,7 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.environ.get("FRONTEND_URL", "http://localhost:3000")],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", os.environ.get("FRONTEND_URL", "*")).split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

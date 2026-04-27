@@ -106,27 +106,13 @@ credentials.json
 *.pem
 *.key
 .credentials
--e 
-# Environment and credential files
-.env
-.env.*
-*.env
-credentials.json
-*.pem
-*.key
-.credentials
 
 # Test reports may contain credentials
 test_reports/
 /app/test_reports/
--e 
-# Environment and credential files
-.env
-.env.*
-*.env
-credentials.json
-*.pem
-*.key
-.credentials
+
+# Local mongo backup snapshot — used for migrating to production
+memory/mongo_backup/
+/app/memory/mongo_backup/
 frontend/node_modules/.cache/default-development/24.pack
 frontend/node_modules/.cache/default-development/26.pack
