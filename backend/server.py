@@ -260,7 +260,7 @@ async def logout(response: Response):
     response.delete_cookie("refresh_token", path="/")
     return {"message": "Logged out"}
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 APP_BUILD_DATE = "2026-04-27"
 
 
@@ -749,6 +749,153 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
     return result
 
 
+async def _process_uploaded_files_streaming(user_id: str, filename_path_pairs: list, max_pdfs: int):
+    """Memory-bounded variant of _process_uploaded_bytes. Used by the chunked
+    upload endpoint where total payload may be hundreds of MB.
+
+    Key difference: ZIPs are opened from disk (zipfile is lazy — only the
+    central directory loads). Each entry's bytes are read, hashed, uploaded
+    to object storage, and discarded one at a time. RAM stays under ~50 MB
+    regardless of upload size.
+    """
+    import hashlib as _hashlib
+    run_id = str(uuid.uuid4())
+
+    def _sha256_of_bytes(data: bytes) -> str:
+        return _hashlib.sha256(data).hexdigest()
+
+    # First pass: count eligible files (memory-cheap — only metadata read)
+    eligible = []  # list of (display_filename, source_kind, source_ref, archive_name)
+    # source_kind = "zip_entry" | "direct"
+    # source_ref  = (zip_path, entry_name)  | direct_file_path
+    for filename, file_path in filename_path_pairs:
+        fname_lower = filename.lower()
+        if fname_lower.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(file_path) as zf:
+                    for name in zf.namelist():
+                        nlower = name.lower()
+                        if any(nlower.endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not name.startswith("__MACOSX"):
+                            eligible.append((name.split("/")[-1], "zip_entry", (file_path, name), filename))
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Invalid ZIP file")
+        elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            eligible.append((filename, "direct", file_path, None))
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}.")
+
+    if not eligible:
+        raise HTTPException(status_code=400, detail="No supported files found in upload")
+    if len(eligible) > max_pdfs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload contains {len(eligible)} files but the per-upload cap is {max_pdfs}. Split the batch (or raise the cap in Admin → Upload Limits) and try again. No files were processed."
+        )
+
+    total_files = len(eligible)
+    run_doc = {
+        "id": run_id, "user_id": user_id, "status": "uploading",
+        "total_files": total_files,
+        "stats": {"total_pdfs": total_files, "processed": 0, "errors": 0,
+                  "contacts_extracted": 0, "duplicates_removed": 0,
+                  "excluded_no_contact": 0, "excluded_internal": 0, "net_new": 0},
+        "created_at": datetime.now(timezone.utc).isoformat(), "completed_at": None
+    }
+    await db.runs.insert_one(run_doc)
+    await db.progress.update_one(
+        {"run_id": run_id},
+        {"$set": {"status": "uploading", "total_files": total_files, "processed_files": 0, "percentage": 0, "message": f"Uploading {total_files} files to storage..."}},
+        upsert=True
+    )
+
+    ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
+              'txt': 'text/plain', 'odt': 'application/vnd.oasis.opendocument.text',
+              'rtf': 'application/rtf', 'eml': 'message/rfc822',
+              'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp',
+              'heic': 'image/heic', 'heif': 'image/heif', 'tiff': 'image/tiff', 'tif': 'image/tiff', 'bmp': 'image/bmp'}
+
+    async def upload_to_storage_streaming():
+        try:
+            file_records = []
+            failed = 0
+            # Batched ZIP open: keep the ZipFile object alive across its entries
+            current_zip_path = None
+            current_zf = None
+            try:
+                for idx, (display_name, kind, ref, archive_name) in enumerate(eligible):
+                    try:
+                        if kind == "zip_entry":
+                            zip_path, entry_name = ref
+                            if current_zip_path != zip_path:
+                                if current_zf is not None:
+                                    current_zf.close()
+                                current_zf = zipfile.ZipFile(zip_path)
+                                current_zip_path = zip_path
+                            file_bytes = current_zf.read(entry_name)
+                        else:
+                            with open(ref, "rb") as f:
+                                file_bytes = f.read()
+                        sha256_hex = _sha256_of_bytes(file_bytes)
+                        ext = display_name.lower().rsplit('.', 1)[-1] if '.' in display_name else 'pdf'
+                        content_type = ct_map.get(ext, 'application/octet-stream')
+                        storage_path = f"{APP_NAME}/uploads/{user_id}/{uuid.uuid4()}.{ext}"
+                        try:
+                            put_object(storage_path, file_bytes, content_type)
+                            file_records.append({
+                                "id": str(uuid.uuid4()), "run_id": run_id, "user_id": user_id,
+                                "storage_path": storage_path, "original_filename": display_name,
+                                "content_type": content_type, "size": len(file_bytes),
+                                "sha256": sha256_hex,
+                                "archive_filename": archive_name,
+                                "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
+                            })
+                        except Exception as up_err:
+                            logger.error(f"Storage upload failed for {display_name}: {up_err}")
+                            failed += 1
+                        finally:
+                            file_bytes = None  # release ASAP
+                    except Exception as e:
+                        logger.error(f"Streaming process failed for {display_name}: {e}")
+                        failed += 1
+                    if idx % 50 == 0:
+                        await db.progress.update_one(
+                            {"run_id": run_id},
+                            {"$set": {"percentage": int(idx / total_files * 50),
+                                       "message": f"Uploading to storage: {idx + 1}/{total_files}..."}}
+                        )
+            finally:
+                if current_zf is not None:
+                    current_zf.close()
+
+            if file_records:
+                await db.files.insert_many(file_records)
+            new_status = "uploaded" if failed < total_files else "failed"
+            await db.runs.update_one({"id": run_id}, {"$set": {"status": new_status, "stats.errors": failed}})
+            await db.progress.update_one(
+                {"run_id": run_id},
+                {"$set": {"status": new_status, "percentage": 50 if new_status == "uploaded" else 0,
+                           "message": "Upload complete — ready for extraction" if new_status == "uploaded" else "Upload failed"}}
+            )
+        except Exception as e:
+            logger.exception(f"Streaming upload failed: {e}")
+            await db.runs.update_one({"id": run_id}, {"$set": {"status": "failed"}})
+            await db.progress.update_one(
+                {"run_id": run_id},
+                {"$set": {"status": "failed", "message": f"Upload error: {e}"}}
+            )
+
+    # Schedule the heavy work in the background — the HTTP response returns immediately
+    asyncio.create_task(upload_to_storage_streaming())
+
+    return {
+        "run_id": run_id,
+        "files": [{"id": "", "filename": display, "size": 0} for display, _, _, _ in eligible[:20]],
+        "total_files": total_files,
+        "max_pdfs": max_pdfs,
+    }
+
+
 @api_router.post("/upload")
 async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     """Direct upload — works for small files (< ~400 MB total). For larger payloads
@@ -756,7 +903,7 @@ async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     """
     user = await get_current_user(request)
     admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
-    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
+    max_pdfs = admin_config.get("max_pdfs_per_upload", 7000) if admin_config else 7000
     pairs = []
     for file in files:
         pairs.append((file.filename, await file.read()))
@@ -829,36 +976,54 @@ async def chunk_complete(upload_id: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Missing chunks: {missing[:10]}")
 
     chunk_dir = os.path.join(CHUNK_UPLOAD_DIR, upload_id)
-    # Reassemble into single bytes blob
-    parts = []
-    for i in range(session["total_chunks"]):
-        p = os.path.join(chunk_dir, f"chunk_{i:06d}.bin")
-        try:
-            with open(p, "rb") as f:
-                parts.append(f.read())
-        except FileNotFoundError:
-            # Chunk staging was wiped (e.g., pod restart between chunks). Tell
-            # the client to re-init and re-upload — the data on /tmp is gone.
-            await db.chunk_uploads.delete_one({"upload_id": upload_id})
-            raise HTTPException(
-                status_code=410,
-                detail="Upload staging was lost (pod restart). Please re-upload — your previous chunks are no longer on disk."
-            )
-    full_bytes = b"".join(parts)
-    if len(full_bytes) != session["total_size"]:
-        logger.warning(f"Chunked upload {upload_id} size mismatch: got {len(full_bytes)}, expected {session['total_size']}")
-
-    # Cleanup chunks immediately
+    # CRITICAL: stream-assemble to disk — never load full payload into RAM.
+    # Loading a 600 MB ZIP plus the join() duplicate would OOM-kill a 1 GB pod.
+    assembled_path = os.path.join(chunk_dir, "_assembled.bin")
+    total_written = 0
     try:
-        import shutil as _sh
-        _sh.rmtree(chunk_dir, ignore_errors=True)
-    except Exception:
-        pass
-    await db.chunk_uploads.delete_one({"upload_id": upload_id})
+        with open(assembled_path, "wb") as out:
+            for i in range(session["total_chunks"]):
+                p = os.path.join(chunk_dir, f"chunk_{i:06d}.bin")
+                try:
+                    with open(p, "rb") as f:
+                        # 4 MB read window — bounded RAM regardless of upload size
+                        while True:
+                            buf = f.read(4 * 1024 * 1024)
+                            if not buf:
+                                break
+                            out.write(buf)
+                            total_written += len(buf)
+                except FileNotFoundError:
+                    await db.chunk_uploads.delete_one({"upload_id": upload_id})
+                    import shutil as _sh
+                    _sh.rmtree(chunk_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=410,
+                        detail="Upload staging was lost (pod restart). Please re-upload — your previous chunks are no longer on disk."
+                    )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Disk write failed during reassembly: {e}")
+
+    if total_written != session["total_size"]:
+        logger.warning(f"Chunked upload {upload_id} size mismatch: got {total_written}, expected {session['total_size']}")
 
     admin_config = await db.admin_config.find_one({"key": "global"}, {"_id": 0})
-    max_pdfs = admin_config.get("max_pdfs_per_upload", 50) if admin_config else 50
-    return await _process_uploaded_bytes(user["_id"], [(session["filename"], full_bytes)], max_pdfs)
+    max_pdfs = admin_config.get("max_pdfs_per_upload", 7000) if admin_config else 7000
+
+    try:
+        return await _process_uploaded_files_streaming(
+            user["_id"],
+            [(session["filename"], assembled_path)],
+            max_pdfs,
+        )
+    finally:
+        # Always cleanup the staging dir, even on error
+        try:
+            import shutil as _sh
+            _sh.rmtree(chunk_dir, ignore_errors=True)
+        except Exception:
+            pass
+        await db.chunk_uploads.delete_one({"upload_id": upload_id})
 
 # =============================================================================
 # EXTRACTION ENGINE — Multi-OCR with fallback + PDF compression
@@ -3372,14 +3537,24 @@ async def delete_all_data(request: Request):
 # =============================================================================
 @app.on_event("startup")
 async def startup():
-    # Verify required binaries exist (poppler for pdf2image, optional libreoffice
-    # for legacy .doc/.xls). In Emergent production these are baked into the image;
-    # in dev they're installed via the deploy script. We just log a warning if missing.
+    # Verify required binaries. Poppler is small (~10 MB) — try a lazy install
+    # if missing because PDF processing depends on it. LibreOffice is too big
+    # (~600 MB) to install at runtime in a 1 GB pod, so we just log and
+    # proceed; .doc/.xls/.odt/.rtf will degrade to "no fallback available".
     import subprocess
     try:
         subprocess.run(["which", "pdftoppm"], check=True, capture_output=True)
     except subprocess.CalledProcessError:
-        logger.warning("poppler-utils not found — PDF processing will fail")
+        logger.warning("poppler-utils not found, attempting install...")
+        try:
+            r = subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "poppler-utils"],
+                              capture_output=True, timeout=60)
+            if r.returncode == 0:
+                logger.info("poppler-utils installed successfully")
+            else:
+                logger.error(f"poppler-utils install failed: {r.stderr.decode()[:200]}")
+        except Exception as e:
+            logger.error(f"poppler-utils install crashed: {e}")
     try:
         subprocess.run(["which", "libreoffice"], check=True, capture_output=True)
     except subprocess.CalledProcessError:
