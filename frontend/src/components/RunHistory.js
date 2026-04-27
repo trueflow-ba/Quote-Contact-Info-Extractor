@@ -88,8 +88,39 @@ export default function RunHistory({ runs, onSelectRun, onDeleteRun, onRetryRun,
     );
   }
 
+  // Surface uploaded-but-not-started runs (these are the "Pending" files in the
+  // Master Index — they are sitting waiting for the user to click Extract)
+  const unstartedRuns = runs.filter(r => r.status === 'uploaded');
+  const totalUnstartedFiles = unstartedRuns.reduce((acc, r) => acc + (r?.stats?.total_pdfs || 0), 0);
+
   return (
     <>
+      {unstartedRuns.length > 0 && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-sm px-4 py-3 mb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3" data-testid="unstarted-banner">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" strokeWidth={1.5} />
+            <div>
+              <p className="text-sm text-amber-200 font-medium">
+                {unstartedRuns.length} run{unstartedRuns.length === 1 ? '' : 's'} waiting · {totalUnstartedFiles.toLocaleString()} file{totalUnstartedFiles === 1 ? '' : 's'} ready for extraction
+              </p>
+              <p className="text-xs text-amber-300/80 mt-0.5">
+                These uploads finished but extraction never started. Master Index marks them as <span className="font-medium">Pending</span>. Click <span className="font-mono bg-amber-500/20 px-1 rounded">Extract</span> on any run below to begin.
+              </p>
+            </div>
+          </div>
+          {unstartedRuns.length === 1 && (
+            <button
+              onClick={(e) => handleRetry(e, unstartedRuns[0].id)}
+              disabled={retrying === unstartedRuns[0].id}
+              className="text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-sm px-4 py-1.5 transition-colors inline-flex items-center gap-1.5 disabled:opacity-50 shrink-0"
+              data-testid="banner-extract-button"
+            >
+              <RotateCcw className={`h-3.5 w-3.5 ${retrying === unstartedRuns[0].id ? 'animate-spin' : ''}`} />
+              Start Extraction Now
+            </button>
+          )}
+        </div>
+      )}
       <div className="space-y-2" data-testid="run-history-list">
         {runs.map(run => {
           const s = run.stats || {};

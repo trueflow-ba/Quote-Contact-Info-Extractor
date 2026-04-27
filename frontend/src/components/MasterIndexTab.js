@@ -238,6 +238,8 @@ export default function MasterIndexTab() {
                 <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Ext</TableHead>
                 <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Status</TableHead>
                 <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Contacts</TableHead>
+                <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Source Archive</TableHead>
+                <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Run</TableHead>
                 <TableHead className="bg-[#111827] text-slate-400 font-medium text-xs uppercase tracking-wider py-3 px-3">Last Uploaded</TableHead>
               </TableRow>
             </TableHeader>
@@ -254,13 +256,24 @@ export default function MasterIndexTab() {
                       </span>
                     </TableCell>
                     <TableCell className="py-2 px-3 font-mono text-xs text-slate-300">{r.contacts_count || <span className="text-slate-600">-</span>}</TableCell>
+                    <TableCell className="py-2 px-3 font-mono text-xs text-slate-400 max-w-xs truncate" title={r.archive_filename || ''}>
+                      {r.archive_filename || <span className="text-slate-700">direct upload</span>}
+                    </TableCell>
+                    <TableCell className="py-2 px-3 font-mono text-xs">
+                      {r.run_id ? (
+                        <span className="text-slate-400" title={r.run_id}>
+                          <span className="text-slate-300">{r.run_id.slice(0,8)}</span>
+                          {r.run_status && <span className="text-slate-600 ml-1">· {r.run_status}</span>}
+                        </span>
+                      ) : <span className="text-slate-700">-</span>}
+                    </TableCell>
                     <TableCell className="py-2 px-3 text-xs text-slate-500">{formatDate(r.processed_at)}</TableCell>
                   </TableRow>
                 );
               })}
               {filtered.length === 0 && (
                 <TableRow className="border-slate-800">
-                  <TableCell colSpan={5} className="text-center text-slate-500 py-8 text-sm">No files match the current filters.</TableCell>
+                  <TableCell colSpan={7} className="text-center text-slate-500 py-8 text-sm">No files match the current filters.</TableCell>
                 </TableRow>
               )}
             </TableBody>

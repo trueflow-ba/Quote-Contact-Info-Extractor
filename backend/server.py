@@ -635,6 +635,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
         )
 
     # Second pass: actually unpack the bytes.
+    # pdf_buffers entry: (filename, bytes, sha256_hex, archive_filename_or_None)
     for filename, data in filename_bytes_pairs:
         fname_lower = filename.lower()
         if fname_lower.endswith(".zip"):
@@ -643,9 +644,9 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                     nlower = name.lower()
                     if any(nlower.endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not name.startswith("__MACOSX"):
                         inner_bytes = zf.read(name)
-                        pdf_buffers.append((name.split("/")[-1], inner_bytes, _sha256_hex(inner_bytes)))
+                        pdf_buffers.append((name.split("/")[-1], inner_bytes, _sha256_hex(inner_bytes), filename))
         elif any(fname_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-            pdf_buffers.append((filename, data, _sha256_hex(data)))
+            pdf_buffers.append((filename, data, _sha256_hex(data), None))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}. Accepted: PDF, DOCX, XLSX, TXT, ODT, RTF, EML, images (JPG/PNG/WEBP/HEIC/TIFF/BMP), and ZIP files.")
 
@@ -675,7 +676,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
         try:
             file_records = []
             failed_uploads = 0
-            for idx, (filename, pdf_data, sha256_hex) in enumerate(pdf_buffers):
+            for idx, (filename, pdf_data, sha256_hex, archive_name) in enumerate(pdf_buffers):
                 ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else 'pdf'
                 ct_map = {'pdf': 'application/pdf', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                           'doc': 'application/msword', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xls': 'application/vnd.ms-excel',
@@ -692,6 +693,7 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
                         "storage_path": storage_path, "original_filename": filename,
                         "content_type": content_type, "size": len(pdf_data),
                         "sha256": sha256_hex,
+                        "archive_filename": archive_name,
                         "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()
                     })
                 except Exception as e:
@@ -732,10 +734,6 @@ async def _process_uploaded_bytes(user_id: str, filename_bytes_pairs: list, max_
         "total_files": total_files,
         "max_pdfs": max_pdfs,
     }
-    if rejected_files:
-        result["rejected_count"] = len(rejected_files)
-        result["rejected_files"] = rejected_files[:10]
-        result["message"] = f"Upload limit is {max_pdfs} PDFs. {len(rejected_files)} file(s) were rejected."
     return result
 
 
@@ -3176,7 +3174,8 @@ async def _compare_master_index(user_id: str):
       - "Processed (no contacts)" — file exists, run completed, no contacts/errors
       - "Error"                 — file exists AND has a processing error
       - "Pending"               — file uploaded but run not yet completed
-      - "Not Uploaded"          — filename never seen
+      - "Not Uploaded"          — filename never seen, OR the run that uploaded
+                                  it was deleted (orphaned file rows)
     """
     master = await db.master_index.find_one({"user_id": user_id}, {"_id": 0})
     if not master:
@@ -3185,14 +3184,13 @@ async def _compare_master_index(user_id: str):
     if not entries:
         return master, []
 
-    # Build a lookup: filename -> {has_file, latest_run_id, size, processed_at, contacts_count, has_error}
-    # Case-sensitive exact match.
-    lookups: dict = {name: {"has_file": False, "run_id": "", "size": 0, "processed_at": "", "contacts_count": 0, "has_error": False, "run_status": ""} for name in entries}
+    lookups: dict = {name: {"has_file": False, "run_id": "", "size": 0, "processed_at": "",
+                             "contacts_count": 0, "has_error": False, "run_status": "",
+                             "archive_filename": None} for name in entries}
 
-    # Files collection — keep most recent per filename
     async for f in db.files.find(
         {"user_id": user_id, "original_filename": {"$in": entries}},
-        {"_id": 0, "original_filename": 1, "run_id": 1, "size": 1, "created_at": 1}
+        {"_id": 0, "original_filename": 1, "run_id": 1, "size": 1, "created_at": 1, "archive_filename": 1}
     ):
         nm = f.get("original_filename", "")
         row = lookups.get(nm)
@@ -3202,17 +3200,33 @@ async def _compare_master_index(user_id: str):
                 row["processed_at"] = f.get("created_at", "")
                 row["run_id"] = f.get("run_id", "")
                 row["size"] = f.get("size", 0)
+                row["archive_filename"] = f.get("archive_filename")
 
-    # Fetch statuses of the involved runs
+    # Fetch statuses of involved runs. Any run_id that does NOT come back is
+    # ORPHANED (run was deleted) and we treat the file as "Not Uploaded" so
+    # the user can re-upload it; SHA-256 dedup will skip the LLM if bytes match.
     involved_run_ids = {r["run_id"] for r in lookups.values() if r["run_id"]}
+    seen_runs = set()
     if involved_run_ids:
         async for r in db.runs.find(
             {"user_id": user_id, "id": {"$in": list(involved_run_ids)}},
             {"_id": 0, "id": 1, "status": 1}
         ):
+            seen_runs.add(r["id"])
             for info in lookups.values():
                 if info["run_id"] == r.get("id"):
                     info["run_status"] = r.get("status", "")
+    # Mark orphans (run was deleted but file rows remain). Count them
+    # separately so the UI can hint that they were reclassified.
+    orphan_count = 0
+    orphan_run_ids = involved_run_ids - seen_runs
+    if orphan_run_ids:
+        for info in lookups.values():
+            if info["run_id"] in orphan_run_ids:
+                info["has_file"] = False  # Treat as Not Uploaded
+                info["run_id"] = ""
+                info["run_status"] = ""
+                orphan_count += 1
 
     # Contacts counts per filename
     agg = db.contacts.aggregate([
@@ -3224,7 +3238,6 @@ async def _compare_master_index(user_id: str):
         if nm in lookups:
             lookups[nm]["contacts_count"] = row.get("n", 0)
 
-    # Errors — processing_errors stores filename under `filename`
     err_names_cursor = db.processing_errors.find(
         {"user_id": user_id, "filename": {"$in": entries}},
         {"_id": 0, "filename": 1}
@@ -3234,9 +3247,10 @@ async def _compare_master_index(user_id: str):
         if nm in lookups:
             lookups[nm]["has_error"] = True
 
-    # Build results preserving master-list order
     results = []
-    summary = {"total": len(entries), "processed": 0, "processed_no_contacts": 0, "errored": 0, "pending": 0, "not_uploaded": 0}
+    summary = {"total": len(entries), "processed": 0, "processed_no_contacts": 0,
+               "errored": 0, "pending": 0, "not_uploaded": 0,
+               "orphaned_reclassified": orphan_count}
     by_type: dict = {}
     run_completed_statuses = {"completed", "cancelled"}
 
@@ -3260,15 +3274,11 @@ async def _compare_master_index(user_id: str):
 
         ext = _file_ext(nm)
         if ext not in by_type:
-            by_type[ext] = {"total": 0, "processed": 0, "processed_no_contacts": 0, "errored": 0, "pending": 0, "not_uploaded": 0}
+            by_type[ext] = {"total": 0, "processed": 0, "processed_no_contacts": 0,
+                            "errored": 0, "pending": 0, "not_uploaded": 0}
         by_type[ext]["total"] += 1
-        key = {
-            "Processed": "processed",
-            "Processed (no contacts)": "processed_no_contacts",
-            "Error": "errored",
-            "Pending": "pending",
-            "Not Uploaded": "not_uploaded",
-        }[status]
+        key = {"Processed": "processed", "Processed (no contacts)": "processed_no_contacts",
+               "Error": "errored", "Pending": "pending", "Not Uploaded": "not_uploaded"}[status]
         by_type[ext][key] += 1
 
         results.append({
@@ -3276,9 +3286,11 @@ async def _compare_master_index(user_id: str):
             "extension": ext,
             "status": status,
             "run_id": info["run_id"],
+            "run_status": info["run_status"],
             "size": info["size"],
             "processed_at": info["processed_at"],
             "contacts_count": info["contacts_count"],
+            "archive_filename": info["archive_filename"],
         })
 
     summary["by_type"] = [
@@ -3313,9 +3325,9 @@ async def download_master_index_comparison(request: Request):
         raise HTTPException(status_code=404, detail="No master index uploaded")
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["FileName", "Extension", "Status", "Contacts Extracted", "Run ID", "Size", "Processed At"])
+    writer.writerow(["FileName", "Extension", "Status", "Contacts Extracted", "Source Archive", "Run ID", "Run Status", "Size", "Processed At"])
     for r in comparison["results"]:
-        writer.writerow([r["filename"], r["extension"], r["status"], r["contacts_count"], r["run_id"], r["size"], r["processed_at"]])
+        writer.writerow([r["filename"], r["extension"], r["status"], r["contacts_count"], r.get("archive_filename") or "", r["run_id"], r.get("run_status",""), r["size"], r["processed_at"]])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
