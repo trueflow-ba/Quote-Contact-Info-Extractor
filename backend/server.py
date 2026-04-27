@@ -260,7 +260,7 @@ async def logout(response: Response):
     response.delete_cookie("refresh_token", path="/")
     return {"message": "Logged out"}
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 APP_BUILD_DATE = "2026-04-27"
 
 
@@ -951,9 +951,13 @@ async def chunk_upload(upload_id: str, request: Request,
     # init-time mkdir may be gone by the time chunks start arriving.
     os.makedirs(chunk_dir, exist_ok=True)
     chunk_path = os.path.join(chunk_dir, f"chunk_{index:06d}.bin")
-    data = await chunk.read()
+    # Stream chunk straight to disk. Avoid `await chunk.read()` which loads
+    # the full 25 MB chunk into RAM — with 6 parallel browser connections
+    # that's ~150 MB of in-flight RAM and can OOM a 1 GB pod.
+    import shutil as _sh
     with open(chunk_path, "wb") as f:
-        f.write(data)
+        _sh.copyfileobj(chunk.file, f, length=1024 * 1024)
+    await chunk.close()
     await db.chunk_uploads.update_one(
         {"upload_id": upload_id},
         {"$addToSet": {"received_chunks": index}}
