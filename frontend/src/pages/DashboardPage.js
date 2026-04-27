@@ -191,10 +191,29 @@ export default function DashboardPage() {
       const fd = new FormData();
       fd.append('index', String(i));
       fd.append('chunk', blob, `chunk_${i}`);
-      await api.post(`/upload/chunk/${uploadId}`, fd, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 120000
-      });
+      try {
+        await api.post(`/upload/chunk/${uploadId}`, fd, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 120000
+        });
+      } catch (err) {
+        // If the access token expired mid-upload (rare on 8h TTL but possible
+        // for marathon uploads), refresh once and retry this chunk. The axios
+        // response interceptor can miss FormData retries, so we handle it here.
+        if (err?.response?.status === 401) {
+          try {
+            await api.post('/auth/refresh', {});
+            await api.post(`/upload/chunk/${uploadId}`, fd, {
+              headers: { 'Content-Type': 'multipart/form-data' },
+              timeout: 120000
+            });
+          } catch (retryErr) {
+            throw new Error(`Auth expired during upload and refresh failed at chunk ${i + 1}/${totalChunks}. Please log in and retry.`);
+          }
+        } else {
+          throw err;
+        }
+      }
       if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
     }
     const { data } = await api.post(`/upload/chunk/${uploadId}/complete`, {}, { timeout: 300000 });

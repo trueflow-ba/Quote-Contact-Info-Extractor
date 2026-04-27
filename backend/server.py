@@ -129,7 +129,7 @@ def get_jwt_secret():
     return os.environ["JWT_SECRET"]
 
 def create_access_token(user_id: str, email: str) -> str:
-    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(minutes=15), "type": "access"}
+    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=8), "type": "access"}
     return pyjwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 def create_refresh_token(user_id: str) -> str:
@@ -260,7 +260,7 @@ async def logout(response: Response):
     response.delete_cookie("refresh_token", path="/")
     return {"message": "Logged out"}
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 APP_BUILD_DATE = "2026-04-27"
 
 

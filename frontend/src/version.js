@@ -6,5 +6,5 @@
 //                         heavy ML deps (torch/easyocr/cuda); LO startup quiet
 //   0.2.0 (2026-04-25) — orphan auto-cleanup; archive provenance; Resume banner
 //   0.1.x — pre-versioning
-export const APP_VERSION = '0.4.1';
+export const APP_VERSION = '0.4.2';
 export const APP_BUILD_DATE = '2026-04-27';
